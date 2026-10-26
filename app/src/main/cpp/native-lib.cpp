@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include <cstdint>
 
 #include "llama.h"
 
@@ -13,7 +14,7 @@ static std::mutex g_mutex;
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_dumdam_ai_MainActivity_nativeLoadModel(
+Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         JNIEnv* env,
         jobject,
         jstring jpath,
@@ -21,6 +22,7 @@ Java_com_dumdam_ai_MainActivity_nativeLoadModel(
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // Освобождаем предыдущую модель, если она была загружена.
     if (g_context != nullptr) {
         llama_free(g_context);
         g_context = nullptr;
@@ -31,11 +33,24 @@ Java_com_dumdam_ai_MainActivity_nativeLoadModel(
         g_model = nullptr;
     }
 
+    if (jpath == nullptr) {
+        return env->NewStringUTF(
+            "ERROR: Путь к GGUF-модели не указан."
+        );
+    }
+
     const char* path = env->GetStringUTFChars(jpath, nullptr);
+
+    if (path == nullptr) {
+        return env->NewStringUTF(
+            "ERROR: Не удалось получить путь к модели."
+        );
+    }
 
     llama_model_params modelParams =
         llama_model_default_params();
 
+    // Совместимый базовый режим: вычисления на CPU.
     modelParams.n_gpu_layers = 0;
 
     g_model = llama_model_load_from_file(
@@ -47,17 +62,18 @@ Java_com_dumdam_ai_MainActivity_nativeLoadModel(
 
     if (g_model == nullptr) {
         return env->NewStringUTF(
-            "ERROR: Не удалось загрузить GGUF-модель."
+            "ERROR: Не удалось загрузить модель. Проверьте GGUF-файл и свободную память."
         );
     }
 
     llama_context_params contextParams =
         llama_context_default_params();
 
+    const int safeContextSize =
+        std::max(512, std::min(4096, static_cast<int>(contextSize)));
+
     contextParams.n_ctx =
-        static_cast<uint32_t>(
-            std::max(512, std::min(4096, (int)contextSize))
-        );
+        static_cast<uint32_t>(safeContextSize);
 
     contextParams.n_threads = 4;
     contextParams.n_threads_batch = 4;
@@ -72,7 +88,7 @@ Java_com_dumdam_ai_MainActivity_nativeLoadModel(
         g_model = nullptr;
 
         return env->NewStringUTF(
-            "ERROR: Не удалось создать контекст модели."
+            "ERROR: Не удалось создать контекст. Попробуйте уменьшить его размер."
         );
     }
 
@@ -81,7 +97,7 @@ Java_com_dumdam_ai_MainActivity_nativeLoadModel(
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_dumdam_ai_MainActivity_nativeGenerate(
+Java_com_ramzes_ai_MainActivity_nativeGenerate(
         JNIEnv* env,
         jobject,
         jstring jprompt,
@@ -95,16 +111,28 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
         );
     }
 
+    if (jprompt == nullptr) {
+        return env->NewStringUTF(
+            "Текст запроса пуст."
+        );
+    }
+
     const char* promptChars =
         env->GetStringUTFChars(jprompt, nullptr);
 
-    std::string prompt(promptChars);
+    if (promptChars == nullptr) {
+        return env->NewStringUTF(
+            "Не удалось прочитать текст запроса."
+        );
+    }
 
+    std::string prompt(promptChars);
     env->ReleaseStringUTFChars(jprompt, promptChars);
 
     const llama_vocab* vocab =
         llama_model_get_vocab(g_model);
 
+    // Сначала определяем требуемое количество токенов.
     int tokenCount = -llama_tokenize(
         vocab,
         prompt.c_str(),
@@ -139,6 +167,15 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
         );
     }
 
+    // Не допускаем переполнения контекста модели.
+    const uint32_t contextCapacity = llama_n_ctx(g_context);
+
+    if (static_cast<uint32_t>(tokenCount + 1) >= contextCapacity) {
+        return env->NewStringUTF(
+            "Запрос слишком длинный. Уменьшите историю сообщений."
+        );
+    }
+
     llama_memory_clear(
         llama_get_memory(g_context),
         true
@@ -149,6 +186,13 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
         0,
         1
     );
+
+    if (batch.token == nullptr) {
+        llama_batch_free(batch);
+        return env->NewStringUTF(
+            "Не удалось выделить память для обработки запроса."
+        );
+    }
 
     for (int i = 0; i < tokenCount; ++i) {
         batch.token[i] = tokens[i];
@@ -185,9 +229,10 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
             break;
         }
 
-        int vocabSize = llama_vocab_n_tokens(vocab);
+        const int vocabSize = llama_vocab_n_tokens(vocab);
         llama_token nextToken = 0;
 
+        // Простой жадный выбор токена с наибольшим логитом.
         for (int t = 1; t < vocabSize; ++t) {
             if (logits[t] > logits[nextToken]) {
                 nextToken = t;
@@ -213,6 +258,7 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
             output.append(piece, pieceSize);
         }
 
+        // Передаём сгенерированный токен для следующего шага.
         batch.n_tokens = 1;
         batch.token[0] = nextToken;
         batch.pos[0] = tokenCount + i;
@@ -232,7 +278,7 @@ Java_com_dumdam_ai_MainActivity_nativeGenerate(
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_dumdam_ai_MainActivity_nativeUnloadModel(
+Java_com_ramzes_ai_MainActivity_nativeUnloadModel(
         JNIEnv*,
         jobject) {
 
