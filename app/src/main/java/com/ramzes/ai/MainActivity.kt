@@ -1,3 +1,4 @@
+
 package com.ramzes.ai
 
 import android.app.Activity
@@ -19,7 +20,6 @@ import java.io.FileOutputStream
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
-
     private lateinit var status: TextView
     private lateinit var chat: TextView
     private lateinit var input: EditText
@@ -33,11 +33,8 @@ class MainActivity : Activity() {
         getSharedPreferences("ramzes_history", MODE_PRIVATE)
     }
 
-    @Volatile
-    private var modelLoaded = false
-
-    @Volatile
-    private var busy = false
+    @Volatile private var modelLoaded = false
+    @Volatile private var busy = false
 
     companion object {
         private const val PICK_MODEL = 100
@@ -61,10 +58,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         createInterface()
         restoreHistory()
-
         status.text = "Модель не загружена"
     }
 
@@ -113,24 +108,17 @@ class MainActivity : Activity() {
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-
-            addView(
-                input,
-                LinearLayout.LayoutParams(0, -2, 1f)
-            )
-
+            addView(input, LinearLayout.LayoutParams(0, -2, 1f))
             addView(sendButton)
         }
 
         root.addView(title)
         root.addView(status)
         root.addView(modelButton)
-
         root.addView(
             scrollView,
             LinearLayout.LayoutParams(-1, 0, 1f)
         )
-
         root.addView(bottom)
         setContentView(root)
     }
@@ -142,7 +130,6 @@ class MainActivity : Activity() {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
         }
-
         startActivityForResult(intent, PICK_MODEL)
     }
 
@@ -153,10 +140,7 @@ class MainActivity : Activity() {
         data: Intent?
     ) {
         super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) {
-            return
-        }
+        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) return
 
         val uri = data?.data ?: return
 
@@ -174,10 +158,8 @@ class MainActivity : Activity() {
                     status.text = "Загрузка модели..."
                 }
 
-                val result = nativeLoadModel(
-                    modelFile.absolutePath,
-                    2048
-                )
+                // Сначала используем меньший контекст, чтобы снизить расход памяти.
+                val result = nativeLoadModel(modelFile.absolutePath, 1024)
 
                 runOnUiThread {
                     modelLoaded = result == "OK"
@@ -186,7 +168,6 @@ class MainActivity : Activity() {
                     } else {
                         result.removePrefix("ERROR: ")
                     }
-
                     busy = false
                     sendButton.isEnabled = true
                     modelButton.isEnabled = true
@@ -197,7 +178,6 @@ class MainActivity : Activity() {
                     busy = false
                     status.text =
                         "Ошибка загрузки: ${e.message ?: "неизвестная ошибка"}"
-
                     sendButton.isEnabled = true
                     modelButton.isEnabled = true
                 }
@@ -207,7 +187,6 @@ class MainActivity : Activity() {
 
     private fun copyModel(uri: Uri): File {
         val directory = File(filesDir, "models")
-
         if (!directory.exists() && !directory.mkdirs()) {
             error("Не удалось создать папку моделей")
         }
@@ -259,7 +238,6 @@ class MainActivity : Activity() {
 
             recentMessages.forEach { (speaker, message) ->
                 val role = if (speaker == "Вы") "user" else "assistant"
-
                 append("<|im_start|>")
                 append(role)
                 append('\n')
@@ -273,7 +251,6 @@ class MainActivity : Activity() {
 
     private fun sendMessage() {
         val question = input.text.toString().trim()
-
         if (question.isEmpty()) return
 
         if (busy) {
@@ -287,13 +264,11 @@ class MainActivity : Activity() {
         }
 
         input.setText("")
-
         messages.add("Вы" to question)
         renderChat()
         saveHistory()
 
         val prompt = buildPrompt()
-
         busy = true
         sendButton.isEnabled = false
         modelButton.isEnabled = false
@@ -314,10 +289,8 @@ class MainActivity : Activity() {
 
             runOnUiThread {
                 messages.add("RAMZES AI" to answer)
-
                 renderChat()
                 saveHistory()
-
                 status.text = "Готово"
                 busy = false
                 sendButton.isEnabled = true
@@ -330,7 +303,6 @@ class MainActivity : Activity() {
         chat.text = messages.joinToString("\n\n") {
             "${it.first}:\n${it.second}"
         }
-
         scrollView.post {
             scrollView.fullScroll(ScrollView.FOCUS_DOWN)
         }
@@ -338,7 +310,6 @@ class MainActivity : Activity() {
 
     private fun saveHistory() {
         val array = JSONArray()
-
         messages.forEach { (speaker, message) ->
             array.put(
                 JSONObject()
@@ -346,27 +317,19 @@ class MainActivity : Activity() {
                     .put("message", message)
             )
         }
-
-        prefs.edit()
-            .putString("messages", array.toString())
-            .apply()
+        prefs.edit().putString("messages", array.toString()).apply()
     }
 
     private fun restoreHistory() {
         try {
-            val array = JSONArray(
-                prefs.getString("messages", "[]")
-            )
-
+            val array = JSONArray(prefs.getString("messages", "[]"))
             for (i in 0 until array.length()) {
                 val item = array.getJSONObject(i)
-
                 messages.add(
                     item.getString("speaker") to
                         item.getString("message")
                 )
             }
-
             renderChat()
         } catch (_: Exception) {
             messages.clear()
@@ -374,15 +337,14 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        // Не выгружаем модель, пока выполняется нативный вызов.
+        // Не вызываем выгрузку, пока другой поток работает с нативной моделью.
         if (!busy) {
             try {
                 nativeUnloadModel()
             } catch (_: Exception) {
-                // Библиотека может быть не загружена.
+                // Ошибка выгрузки не должна мешать закрытию Activity.
             }
         }
-
         super.onDestroy()
     }
 }
