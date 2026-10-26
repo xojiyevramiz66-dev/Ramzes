@@ -17,6 +17,10 @@ static llama_model* g_model = nullptr;
 static llama_context* g_context = nullptr;
 static std::mutex g_mutex;
 
+static jstring makeString(JNIEnv* env, const std::string& value) {
+    return env->NewStringUTF(value.c_str());
+}
+
 static void unloadModelLocked() {
     if (g_context != nullptr) {
         llama_free(g_context);
@@ -27,10 +31,6 @@ static void unloadModelLocked() {
         llama_model_free(g_model);
         g_model = nullptr;
     }
-}
-
-static jstring makeString(JNIEnv* env, const std::string& value) {
-    return env->NewStringUTF(value.c_str());
 }
 
 extern "C"
@@ -50,25 +50,29 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
     }
 
     const char* pathChars = env->GetStringUTFChars(jpath, nullptr);
+
     if (pathChars == nullptr) {
         return makeString(env, "ERROR: Не удалось прочитать путь.");
     }
 
-    const std::string path(pathChars);
+    std::string path(pathChars);
     env->ReleaseStringUTFChars(jpath, pathChars);
 
-    LOGI("Начало загрузки модели: %s", path.c_str());
+    LOGI("Загрузка GGUF: %s", path.c_str());
 
     llama_model_params modelParams = llama_model_default_params();
     modelParams.n_gpu_layers = 0;
 
-    g_model = llama_model_load_from_file(path.c_str(), modelParams);
+    g_model = llama_model_load_from_file(
+        path.c_str(),
+        modelParams
+    );
 
     if (g_model == nullptr) {
-        LOGE("Не удалось загрузить модель");
+        LOGE("Ошибка загрузки GGUF");
         return makeString(
             env,
-            "ERROR: Не удалось загрузить модель. Проверьте GGUF-файл и свободную память."
+            "ERROR: Не удалось загрузить GGUF. Проверьте файл и свободную память."
         );
     }
 
@@ -86,15 +90,17 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
     g_context = llama_init_from_model(g_model, contextParams);
 
     if (g_context == nullptr) {
-        LOGE("Не удалось создать контекст");
+        LOGE("Ошибка создания контекста");
         unloadModelLocked();
+
         return makeString(
             env,
-            "ERROR: Не удалось создать контекст. Попробуйте освободить память."
+            "ERROR: Не удалось создать контекст модели."
         );
     }
 
-    LOGI("Модель загружена; контекст=%d", safeContext);
+    LOGI("Модель и контекст загружены: %d", safeContext);
+
     return makeString(env, "OK");
 }
 
@@ -113,19 +119,20 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     }
 
     if (jprompt == nullptr) {
-        return makeString(env, "Ошибка: запрос пуст.");
+        return makeString(env, "Ошибка: пустой запрос.");
     }
 
     const char* promptChars = env->GetStringUTFChars(jprompt, nullptr);
+
     if (promptChars == nullptr) {
         return makeString(env, "Ошибка чтения запроса.");
     }
 
-    const std::string prompt(promptChars);
+    std::string prompt(promptChars);
     env->ReleaseStringUTFChars(jprompt, promptChars);
 
     if (prompt.empty()) {
-        return makeString(env, "Ошибка: запрос пуст.");
+        return makeString(env, "Ошибка: пустой запрос.");
     }
 
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
@@ -134,9 +141,9 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         return makeString(env, "Ошибка: словарь модели недоступен.");
     }
 
-    LOGI("Токенизация запроса, длина=%zu", prompt.size());
+    LOGI("Начало токенизации, байт=%zu", prompt.size());
 
-    int tokenCount = -llama_tokenize(
+    int required = llama_tokenize(
         vocab,
         prompt.c_str(),
         static_cast<int32_t>(prompt.size()),
@@ -146,17 +153,24 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         true
     );
 
-    if (tokenCount <= 0) {
-        LOGE("Не удалось определить число токенов: %d", tokenCount);
+    if (required >= 0) {
+        LOGE("Не удалось получить размер токенизации: %d", required);
         return makeString(env, "Ошибка токенизации запроса.");
+    }
+
+    int tokenCount = -required;
+
+    if (tokenCount <= 0) {
+        return makeString(env, "Ошибка: запрос не содержит токенов.");
     }
 
     const uint32_t contextCapacity = llama_n_ctx(g_context);
 
-    if (static_cast<uint32_t>(tokenCount + 2) >= contextCapacity) {
+    // Оставляем место хотя бы для одного генерируемого токена.
+    if (static_cast<uint32_t>(tokenCount + 1) >= contextCapacity) {
         return makeString(
             env,
-            "Запрос слишком длинный. Очистите историю чата и повторите."
+            "Запрос слишком длинный. Очистите историю и повторите."
         );
     }
 
@@ -164,7 +178,7 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         static_cast<size_t>(tokenCount)
     );
 
-    const int actualCount = llama_tokenize(
+    int actualCount = llama_tokenize(
         vocab,
         prompt.c_str(),
         static_cast<int32_t>(prompt.size()),
@@ -174,16 +188,19 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         true
     );
 
-    if (actualCount < 0) {
-        return makeString(env, "Ошибка преобразования текста в токены.");
+    if (actualCount < 0 || actualCount > tokenCount) {
+        LOGE("Ошибка заполнения токенов: %d", actualCount);
+        return makeString(env, "Ошибка преобразования запроса в токены.");
     }
 
     tokenCount = actualCount;
     tokens.resize(static_cast<size_t>(tokenCount));
 
     if (tokenCount == 0) {
-        return makeString(env, "Запрос не содержит токенов.");
+        return makeString(env, "Ошибка: пустая последовательность токенов.");
     }
+
+    LOGI("Запрос содержит %d токенов", tokenCount);
 
     llama_memory_clear(llama_get_memory(g_context), true);
 
@@ -196,7 +213,13 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         batch.logits == nullptr) {
 
         llama_batch_free(batch);
-        return makeString(env, "Не удалось выделить память для генерации.");
+
+        LOGE("Не удалось выделить память для batch");
+
+        return makeString(
+            env,
+            "Ошибка: недостаточно памяти для обработки запроса."
+        );
     }
 
     for (int i = 0; i < tokenCount; ++i) {
@@ -209,57 +232,62 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
 
     batch.n_tokens = tokenCount;
 
-    LOGI("Обработка входных токенов: %d", tokenCount);
+    LOGI("Начало llama_decode для запроса");
 
     const int promptResult = llama_decode(g_context, batch);
 
+    LOGI("llama_decode запроса завершён: %d", promptResult);
+
     if (promptResult != 0) {
-        LOGE("llama_decode(prompt) вернул %d", promptResult);
         llama_batch_free(batch);
-        return makeString(env, "Ошибка обработки запроса моделью.");
+
+        LOGE("Ошибка обработки входных токенов");
+
+        return makeString(
+            env,
+            "Ошибка обработки запроса. Проверьте модель и память устройства."
+        );
+    }
+
+    // Штатный жадный sampler вместо ручного перебора логитов.
+    llama_sampler* sampler = llama_sampler_init_greedy();
+
+    if (sampler == nullptr) {
+        llama_batch_free(batch);
+        return makeString(env, "Ошибка создания sampler.");
     }
 
     const int limit = std::max(
         1,
-        std::min(64, static_cast<int>(maxTokens))
+        std::min(32, static_cast<int>(maxTokens))
     );
 
-    const int vocabSize = llama_vocab_n_tokens(vocab);
     std::string output;
 
-    LOGI("Начало генерации, максимум токенов=%d", limit);
+    LOGI("Начало генерации, лимит=%d", limit);
 
     for (int i = 0; i < limit; ++i) {
         const int position = tokenCount + i;
 
         if (position >= static_cast<int>(contextCapacity)) {
-            LOGI("Достигнут предел контекста");
+            LOGI("Достигнут лимит контекста");
             break;
         }
 
-        float* logits = llama_get_logits_ith(g_context, -1);
-
-        if (logits == nullptr) {
-            LOGE("Логиты недоступны");
-            break;
-        }
-
-        llama_token nextToken = 0;
-
-        for (int t = 1; t < vocabSize; ++t) {
-            if (logits[t] > logits[nextToken]) {
-                nextToken = t;
-            }
-        }
+        llama_token nextToken = llama_sampler_sample(
+            sampler,
+            g_context,
+            -1
+        );
 
         if (llama_vocab_is_eog(vocab, nextToken)) {
-            LOGI("Получен токен завершения");
+            LOGI("Получен токен окончания");
             break;
         }
 
         char piece[1024];
 
-        const int pieceSize = llama_token_to_piece(
+        int pieceSize = llama_token_to_piece(
             vocab,
             nextToken,
             piece,
@@ -268,14 +296,35 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
             true
         );
 
-        if (pieceSize > 0) {
+        if (pieceSize < 0) {
+            std::vector<char> largerBuffer(
+                static_cast<size_t>(-pieceSize)
+            );
+
+            pieceSize = llama_token_to_piece(
+                vocab,
+                nextToken,
+                largerBuffer.data(),
+                static_cast<int32_t>(largerBuffer.size()),
+                0,
+                true
+            );
+
+            if (pieceSize > 0) {
+                output.append(
+                    largerBuffer.data(),
+                    static_cast<size_t>(pieceSize)
+                );
+            }
+        } else if (pieceSize > 0) {
             output.append(piece, static_cast<size_t>(pieceSize));
         }
 
-        LOGI("Сгенерирован токен %d из %d", i + 1, limit);
+        llama_sampler_accept(sampler, nextToken);
 
-        // Не обрабатываем последний токен повторно:
-        // для следующей итерации он должен пройти через llama_decode.
+        LOGI("Сгенерирован токен %d/%d", i + 1, limit);
+
+        // Подготовить следующий шаг генерации.
         batch.n_tokens = 1;
         batch.token[0] = nextToken;
         batch.pos[0] = position;
@@ -283,24 +332,23 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         batch.seq_id[0][0] = 0;
         batch.logits[0] = true;
 
-        if (i + 1 < limit) {
-            const int decodeResult = llama_decode(g_context, batch);
+        const int decodeResult = llama_decode(g_context, batch);
 
-            if (decodeResult != 0) {
-                LOGE("llama_decode(token) вернул %d", decodeResult);
-                break;
-            }
+        if (decodeResult != 0) {
+            LOGE("Ошибка декодирования токена: %d", decodeResult);
+            break;
         }
     }
 
+    llama_sampler_free(sampler);
     llama_batch_free(batch);
 
-    LOGI("Генерация завершена, длина ответа=%zu", output.size());
+    LOGI("Генерация завершена, символов UTF-8: %zu", output.size());
 
     if (output.empty()) {
         return makeString(
             env,
-            "Модель не вернула текст. Проверьте совместимость модели и шаблона чата."
+            "Модель не вернула текст. Проверьте шаблон чата и совместимость GGUF."
         );
     }
 
@@ -314,6 +362,8 @@ Java_com_ramzes_ai_MainActivity_nativeUnloadModel(
         jobject) {
 
     std::lock_guard<std::mutex> lock(g_mutex);
+
     LOGI("Выгрузка модели");
+
     unloadModelLocked();
 }
