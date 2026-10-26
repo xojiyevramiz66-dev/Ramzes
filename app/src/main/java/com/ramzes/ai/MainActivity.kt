@@ -1,4 +1,3 @@
-
 package com.ramzes.ai
 
 import android.app.Activity
@@ -28,8 +27,7 @@ class MainActivity : Activity() {
     private lateinit var modelButton: Button
     private lateinit var scrollView: ScrollView
 
-    private val messages =
-        mutableListOf<Pair<String, String>>()
+    private val messages = mutableListOf<Pair<String, String>>()
 
     private val prefs by lazy {
         getSharedPreferences("ramzes_history", MODE_PRIVATE)
@@ -89,9 +87,7 @@ class MainActivity : Activity() {
 
         modelButton = Button(this).apply {
             text = "Выбрать GGUF-модель"
-            setOnClickListener {
-                chooseModel()
-            }
+            setOnClickListener { chooseModel() }
         }
 
         chat = TextView(this).apply {
@@ -111,9 +107,7 @@ class MainActivity : Activity() {
 
         sendButton = Button(this).apply {
             text = "Отправить"
-            setOnClickListener {
-                sendMessage()
-            }
+            setOnClickListener { sendMessage() }
         }
 
         val bottom = LinearLayout(this).apply {
@@ -138,7 +132,6 @@ class MainActivity : Activity() {
         )
 
         root.addView(bottom)
-
         setContentView(root)
     }
 
@@ -161,15 +154,14 @@ class MainActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode != PICK_MODEL ||
-            resultCode != RESULT_OK
-        ) {
+        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) {
             return
         }
 
-        val uri: Uri = data?.data ?: return
+        val uri = data?.data ?: return
 
         busy = true
+        modelLoaded = false
         sendButton.isEnabled = false
         modelButton.isEnabled = false
         status.text = "Импорт GGUF-модели..."
@@ -189,7 +181,6 @@ class MainActivity : Activity() {
 
                 runOnUiThread {
                     modelLoaded = result == "OK"
-
                     status.text = if (modelLoaded) {
                         "Модель загружена: ${modelFile.name}"
                     } else {
@@ -204,7 +195,6 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     modelLoaded = false
                     busy = false
-
                     status.text =
                         "Ошибка загрузки: ${e.message ?: "неизвестная ошибка"}"
 
@@ -255,6 +245,32 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun buildPrompt(): String {
+        val recentMessages = messages.takeLast(8)
+
+        return buildString {
+            append(
+                "<|im_start|>system\n" +
+                    "Ты RAMZES AI, полезный и точный помощник. " +
+                    "Отвечай на языке пользователя. " +
+                    "Если пользователь пишет по-русски, отвечай по-русски.\n" +
+                    "<|im_end|>\n"
+            )
+
+            recentMessages.forEach { (speaker, message) ->
+                val role = if (speaker == "Вы") "user" else "assistant"
+
+                append("<|im_start|>")
+                append(role)
+                append('\n')
+                append(message)
+                append("\n<|im_end|>\n")
+            }
+
+            append("<|im_start|>assistant\n")
+        }
+    }
+
     private fun sendMessage() {
         val question = input.text.toString().trim()
 
@@ -271,34 +287,17 @@ class MainActivity : Activity() {
         }
 
         input.setText("")
+
         messages.add("Вы" to question)
         renderChat()
         saveHistory()
+
+        val prompt = buildPrompt()
 
         busy = true
         sendButton.isEnabled = false
         modelButton.isEnabled = false
         status.text = "RAMZES AI генерирует ответ..."
-
-        val prompt = buildString {
-            append(
-                "You are RAMZES AI, a helpful assistant. " +
-                    "Answer in the same language as the user.\n"
-            )
-
-            messages.takeLast(12).forEach { (speaker, text) ->
-                if (speaker == "Вы") {
-                    append("User: ")
-                } else {
-                    append("Assistant: ")
-                }
-
-                append(text)
-                append('\n')
-            }
-
-            append("Assistant:")
-        }
 
         (getSystemService(Context.INPUT_METHOD_SERVICE)
             as InputMethodManager)
@@ -306,8 +305,8 @@ class MainActivity : Activity() {
 
         thread {
             val answer = try {
-                nativeGenerate(prompt, 256).ifBlank {
-                    "Модель не вернула текст. Попробуйте другой запрос."
+                nativeGenerate(prompt, 64).ifBlank {
+                    "Модель не вернула текст. Проверьте шаблон чата и модель."
                 }
             } catch (e: Exception) {
                 "Ошибка генерации: ${e.message ?: "неизвестная ошибка"}"
@@ -375,13 +374,12 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        // Не освобождаем нативную модель одновременно с активным вызовом.
-        // Для полноценной версии жизненный цикл движка лучше вынести в сервис.
+        // Не выгружаем модель, пока выполняется нативный вызов.
         if (!busy) {
             try {
                 nativeUnloadModel()
             } catch (_: Exception) {
-                // Библиотека могла не загрузиться.
+                // Библиотека может быть не загружена.
             }
         }
 
