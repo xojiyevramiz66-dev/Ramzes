@@ -1,474 +1,371 @@
-#include <jni.h>
-#include <android/log.h>
+package com.ramzes.ai
 
-#include <algorithm>
-#include <cstdint>
-#include <limits>
-#include <mutex>
-#include <string>
-#include <vector>
+import android.content.Context
+import android.net.Uri
+import android.os.Bundle
+import android.view.Gravity
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
-#include "llama.h"
+class MainActivity : ComponentActivity() {
+    private lateinit var status: TextView
+    private lateinit var chat: TextView
+    private lateinit var input: EditText
+    private lateinit var sendButton: Button
+    private lateinit var modelButton: Button
+    private lateinit var scroll: ScrollView
 
-#define LOG_TAG "RAMZES_AI"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+    private val messages = mutableListOf<Pair<String, String>>()
 
-namespace {
+    @Volatile private var modelLoaded = false
+    @Volatile private var busy = false
+    @Volatile private var destroyed = false
 
-std::mutex g_mutex;
+    private var generateThread: Thread? = null
 
-llama_model *g_model = nullptr;
-llama_context *g_context = nullptr;
-llama_sampler *g_sampler = nullptr;
-
-constexpr int DEFAULT_CONTEXT = 512;
-constexpr int MAX_CONTEXT = 4096;
-constexpr int MAX_GENERATION_TOKENS = 128;
-
-std::string jstringToString(JNIEnv *env, jstring value) {
-    if (value == nullptr) {
-        return {};
+    private val prefs by lazy {
+        getSharedPreferences("ramzes_history", MODE_PRIVATE)
     }
 
-    const char *chars = env->GetStringUTFChars(value, nullptr);
-    if (chars == nullptr) {
-        return {};
-    }
+    companion object {
+        private const val CONTEXT_SIZE = 512
+        private const val MAX_TOKENS = 128
+        private const val MAX_HISTORY = 20
+        private const val PROMPT_HISTORY = 2
+        private const val GENERATION_TIMEOUT_MS = 30000L
 
-    std::string result(chars);
-    env->ReleaseStringUTFChars(value, chars);
-    return result;
-}
-
-jstring makeJavaString(JNIEnv *env, const std::string &value) {
-    return env->NewStringUTF(value.c_str());
-}
-
-void releaseModelLocked() {
-    if (g_sampler != nullptr) {
-        llama_sampler_free(g_sampler);
-        g_sampler = nullptr;
-    }
-
-    if (g_context != nullptr) {
-        llama_free(g_context);
-        g_context = nullptr;
-    }
-
-    if (g_model != nullptr) {
-        llama_model_free(g_model);
-        g_model = nullptr;
-    }
-}
-
-// Создание полностью заполненного пакета из одного токена.
-int decodeOneToken(
-    llama_context *ctx,
-    llama_token token,
-    llama_pos position,
-    bool needLogits
-) {
-    llama_batch batch = llama_batch_init(1, 0, 1);
-
-    if (batch.token == nullptr ||
-        batch.pos == nullptr ||
-        batch.n_seq_id == nullptr ||
-        batch.seq_id == nullptr ||
-        batch.logits == nullptr) {
-        llama_batch_free(batch);
-        LOGE("Не удалось выделить память для batch");
-        return -100;
-    }
-
-    // llama_batch_init выделяет память, но поля не инициализирует.
-    batch.n_tokens = 1;
-    batch.token[0] = token;
-    batch.pos[0] = position;
-    batch.n_seq_id[0] = 1;
-    batch.seq_id[0][0] = 0;
-    batch.logits[0] = needLogits ? 1 : 0;
-
-    const int result = llama_decode(ctx, batch);
-
-    llama_batch_free(batch);
-    return result;
-}
-
-} // namespace
-
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_com_ramzes_ai_MainActivity_nativeLoadModel(
-    JNIEnv *env,
-    jobject /* thiz */,
-    jstring modelPath,
-    jint requestedContext
-) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    releaseModelLocked();
-
-    const std::string path = jstringToString(env, modelPath);
-
-    if (path.empty()) {
-        return makeJavaString(env, "ERROR: Путь к модели пуст.");
-    }
-
-    LOGI("Загрузка модели: %s", path.c_str());
-
-    llama_backend_init();
-
-    llama_model_params modelParams =
-        llama_model_default_params();
-
-    modelParams.n_gpu_layers = 0;
-
-    g_model = llama_model_load_from_file(
-        path.c_str(),
-        modelParams
-    );
-
-    if (g_model == nullptr) {
-        LOGE("Не удалось загрузить GGUF-модель");
-        return makeJavaString(
-            env,
-            "ERROR: Не удалось загрузить модель. Проверьте GGUF-файл и память устройства."
-        );
-    }
-
-    llama_context_params contextParams =
-        llama_context_default_params();
-
-    int contextSize = requestedContext > 0
-        ? requestedContext
-        : DEFAULT_CONTEXT;
-
-    contextSize = std::max(
-        128,
-        std::min(contextSize, MAX_CONTEXT)
-    );
-
-    contextParams.n_ctx = static_cast<uint32_t>(contextSize);
-    contextParams.n_batch = static_cast<uint32_t>(
-        std::min(128, contextSize)
-    );
-    contextParams.n_ubatch = contextParams.n_batch;
-    contextParams.n_threads = 2;
-    contextParams.n_threads_batch = 2;
-
-    g_context = llama_init_from_model(
-        g_model,
-        contextParams
-    );
-
-    if (g_context == nullptr) {
-        LOGE("Не удалось создать контекст");
-        releaseModelLocked();
-
-        return makeJavaString(
-            env,
-            "ERROR: Не удалось создать контекст. Возможно, недостаточно памяти."
-        );
-    }
-
-    g_sampler = llama_sampler_init_greedy();
-
-    if (g_sampler == nullptr) {
-        LOGE("Не удалось создать sampler");
-        releaseModelLocked();
-
-        return makeJavaString(
-            env,
-            "ERROR: Не удалось создать сэмплер."
-        );
-    }
-
-    LOGI(
-        "Модель загружена. Контекст=%d, CPU-потоки=2",
-        contextSize
-    );
-
-    return makeJavaString(env, "OK");
-}
-
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_com_ramzes_ai_MainActivity_nativeGenerate(
-    JNIEnv *env,
-    jobject /* thiz */,
-    jstring userPrompt,
-    jint maxTokens
-) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (g_model == nullptr ||
-        g_context == nullptr ||
-        g_sampler == nullptr) {
-        return makeJavaString(
-            env,
-            "Ошибка: сначала загрузите GGUF-модель."
-        );
-    }
-
-    const std::string prompt = jstringToString(
-        env,
-        userPrompt
-    );
-
-    if (prompt.empty()) {
-        return makeJavaString(env, "Введите сообщение.");
-    }
-
-    const llama_vocab *vocab = llama_model_get_vocab(g_model);
-
-    if (vocab == nullptr) {
-        return makeJavaString(
-            env,
-            "Ошибка: словарь модели недоступен."
-        );
-    }
-
-    LOGI("Начало генерации. Длина промпта: %zu", prompt.size());
-
-    // Первый вызов определяет необходимое количество токенов.
-    int32_t tokenCount = llama_tokenize(
-        vocab,
-        prompt.c_str(),
-        static_cast<int32_t>(prompt.size()),
-        nullptr,
-        0,
-        true,
-        true
-    );
-
-    if (tokenCount < 0) {
-        if (tokenCount == std::numeric_limits<int32_t>::min()) {
-            return makeJavaString(env, "Ошибка токенизации.");
-        }
-        tokenCount = -tokenCount;
-    }
-
-    if (tokenCount <= 0) {
-        return makeJavaString(
-            env,
-            "Ошибка: промпт не удалось преобразовать в токены."
-        );
-    }
-
-    std::vector<llama_token> tokens(
-        static_cast<size_t>(tokenCount)
-    );
-
-    int32_t actualCount = llama_tokenize(
-        vocab,
-        prompt.c_str(),
-        static_cast<int32_t>(prompt.size()),
-        tokens.data(),
-        static_cast<int32_t>(tokens.size()),
-        true,
-        true
-    );
-
-    // Повторяем токенизацию, если буфер оказался мал.
-    if (actualCount < 0) {
-        if (actualCount == std::numeric_limits<int32_t>::min()) {
-            return makeJavaString(env, "Ошибка токенизации.");
-        }
-
-        tokens.resize(static_cast<size_t>(-actualCount));
-
-        actualCount = llama_tokenize(
-            vocab,
-            prompt.c_str(),
-            static_cast<int32_t>(prompt.size()),
-            tokens.data(),
-            static_cast<int32_t>(tokens.size()),
-            true,
-            true
-        );
-    }
-
-    if (actualCount <= 0) {
-        return makeJavaString(
-            env,
-            "Ошибка: токенизация промпта завершилась неудачно."
-        );
-    }
-
-    tokens.resize(static_cast<size_t>(actualCount));
-
-    const int contextSize = static_cast<int>(
-        llama_n_ctx(g_context)
-    );
-
-    if (actualCount >= contextSize) {
-        return makeJavaString(
-            env,
-            "Промпт слишком длинный. Сократите историю сообщений."
-        );
-    }
-
-    int limit = std::max(
-        1,
-        std::min(
-            static_cast<int>(maxTokens),
-            MAX_GENERATION_TOKENS
-        )
-    );
-
-    // Оставляем место для генерации в контексте.
-    limit = std::min(limit, contextSize - actualCount);
-
-    LOGI("Токенов промпта: %d", actualCount);
-    LOGI("Доступно токенов ответа: %d", limit);
-
-    // Каждый запрос начинает новый контекст диалога.
-    llama_memory_clear(
-        llama_get_memory(g_context),
-        true
-    );
-
-    llama_sampler_reset(g_sampler);
-
-    // Обработка входного промпта.
-    for (int32_t i = 0; i < actualCount; ++i) {
-        const bool needLogits = (i == actualCount - 1);
-
-        const int result = decodeOneToken(
-            g_context,
-            tokens[static_cast<size_t>(i)],
-            static_cast<llama_pos>(i),
-            needLogits
-        );
-
-        if (result != 0) {
-            LOGE(
-                "Ошибка decode промпта: token=%d, code=%d",
-                i,
-                result
-            );
-
-            llama_memory_clear(
-                llama_get_memory(g_context),
-                true
-            );
-
-            return makeJavaString(
-                env,
-                "Ошибка обработки промпта (decode " +
-                    std::to_string(result) + ")."
-            );
+        init {
+            try {
+                System.loadLibrary("ramzes_native")
+            } catch (e: UnsatisfiedLinkError) {
+                e.printStackTrace()
+            }
         }
     }
 
-    LOGI("Промпт обработан успешно");
+    private external fun nativeLoadModel(path: String, contextSize: Int): String
+    private external fun nativeGenerate(prompt: String, maxTokens: Int): String
+    private external fun nativeUnloadModel()
 
-    std::string answer;
-    int nPast = actualCount;
+    private val pickModelLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            loadModelFromUri(uri)
+        }
+    }
 
-    // Генерация ответа.
-    for (int i = 0; i < limit; ++i) {
-        const llama_token token = llama_sampler_sample(
-            g_sampler,
-            g_context,
-            -1
-        );
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        createUi()
+        restoreHistory()
+        status.text = if (modelLoaded) "Модель загружена" else "Выберите GGUF-модель"
+        setControls(!busy)
+    }
 
-        if (token < 0) {
-            LOGE("Сэмплер вернул недопустимый токен: %d", token);
-            break;
+    private fun createUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 12, 16, 12)
         }
 
-        if (llama_vocab_is_eog(vocab, token)) {
-            LOGI("Достигнут конец ответа");
-            break;
+        root.addView(TextView(this).apply {
+            text = "RAMZES AI"
+            textSize = 26f
+            gravity = Gravity.CENTER_VERTICAL
+        })
+
+        status = TextView(this).apply {
+            textSize = 14f
+            setPadding(0, 8, 0, 8)
+        }
+        root.addView(status)
+
+        modelButton = Button(this).apply {
+            text = "Выбрать GGUF-модель"
+            setOnClickListener { chooseModel() }
+        }
+        root.addView(modelButton)
+
+        chat = TextView(this).apply {
+            textSize = 16f
+            setTextIsSelectable(true)
+            setPadding(4, 8, 4, 8)
         }
 
-        std::vector<char> piece(256);
+        scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(chat)
+        }
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        int32_t length = llama_token_to_piece(
-            vocab,
-            token,
-            piece.data(),
-            static_cast<int32_t>(piece.size()),
-            0,
-            true
-        );
+        input = EditText(this).apply {
+            hint = "Напишите сообщение..."
+            maxLines = 4
+        }
 
-        if (length < 0) {
-            if (length == std::numeric_limits<int32_t>::min()) {
-                LOGE("Слишком большой фрагмент токена");
-                break;
+        sendButton = Button(this).apply {
+            text = "Отправить"
+            setOnClickListener { sendMessage() }
+        }
+
+        val bottom = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(sendButton)
+        }
+        root.addView(bottom)
+        setContentView(root)
+    }
+
+    private fun chooseModel() {
+        if (busy) return
+        try {
+            pickModelLauncher.launch(arrayOf("*/*"))
+        } catch (e: Exception) {
+            status.text = "Не удалось открыть файл: ${e.message}"
+        }
+    }
+
+    private fun loadModelFromUri(uri: Uri) {
+        if (busy) return
+        busy = true
+        modelLoaded = false
+        setControls(false)
+        status.text = "Копирование модели..."
+
+        thread(name = "ramzes-load") {
+            var result = "Ошибка загрузки модели"
+            try {
+                val file = copyModel(uri)
+                if (destroyed) return@thread
+                runOnUiThread {
+                    if (!destroyed) status.text = "Загрузка модели в память..."
+                }
+                result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
+            } catch (e: Throwable) {
+                result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
+                e.printStackTrace()
             }
 
-            piece.resize(static_cast<size_t>(-length));
-
-            length = llama_token_to_piece(
-                vocab,
-                token,
-                piece.data(),
-                static_cast<int32_t>(piece.size()),
-                0,
-                true
-            );
+            val finalResult = result
+            runOnUiThread {
+                if (!destroyed) {
+                    modelLoaded = finalResult == "OK"
+                    status.text = if (modelLoaded) "Модель загружена" else finalResult
+                    setControls(true)
+                }
+                busy = false
+            }
         }
-
-        if (length > 0) {
-            answer.append(
-                piece.data(),
-                static_cast<size_t>(length)
-            );
-        } else if (length < 0) {
-            LOGE("Ошибка декодирования фрагмента токена");
-            break;
-        }
-
-        // Последний токен уже добавлен в ответ.
-        if (i + 1 >= limit) {
-            break;
-        }
-
-        const int result = decodeOneToken(
-            g_context,
-            token,
-            static_cast<llama_pos>(nPast),
-            true
-        );
-
-        if (result != 0) {
-            LOGE(
-                "Ошибка decode генерации: step=%d, code=%d",
-                i,
-                result
-            );
-            break;
-        }
-
-        ++nPast;
     }
 
-    LOGI("Генерация завершена. Длина ответа: %zu", answer.size());
+    private fun copyModel(uri: Uri): File {
+        val dir = File(filesDir, "models")
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IOException("Не удалось создать папку моделей")
+        }
 
-    if (answer.empty()) {
-        return makeJavaString(
-            env,
-            "Модель вернула пустой ответ. Проверьте совместимость GGUF-модели."
-        );
+        val name = queryDisplayName(uri)
+        if (name != null && !name.endsWith(".gguf", true)) {
+            throw IOException("Выберите файл .gguf")
+        }
+
+        val destination = File(dir, "ramzes_model.gguf")
+        val temp = File(dir, "ramzes_model.tmp")
+
+        contentResolver.openInputStream(uri).use { source ->
+            if (source == null) throw IOException("Не удалось открыть файл")
+            FileOutputStream(temp).use { output ->
+                source.copyTo(output)
+                output.fd.sync()
+            }
+        }
+
+        if (!temp.exists() || temp.length() == 0L) {
+            temp.delete()
+            throw IOException("Файл модели пуст")
+        }
+
+        if (destination.exists() && !destination.delete()) {
+            temp.delete()
+            throw IOException("Не удалось заменить старую модель")
+        }
+
+        if (!temp.renameTo(destination)) {
+            temp.copyTo(destination, overwrite = true)
+            temp.delete()
+        }
+
+        return destination
     }
 
-    return makeJavaString(env, answer);
-}
+    private fun queryDisplayName(uri: Uri): String? {
+        return try {
+            contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val i = cursor.getColumnIndex(
+                        android.provider.OpenableColumns.DISPLAY_NAME
+                    )
+                    if (i >= 0) cursor.getString(i) else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_ramzes_ai_MainActivity_nativeUnloadModel(
-    JNIEnv * /* env */,
-    jobject /* thiz */
-) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // УПРОЩЁННЫЙ ПРОМПТ: без ChatML, чтобы исключить несовместимость шаблона
+    private fun buildPrompt(): String {
+        val recent = messages.takeLast(PROMPT_HISTORY)
+        return buildString {
+            recent.forEach { (speaker, text) ->
+                append("$speaker: $text\n")
+            }
+            append("RAMZES AI:")
+        }
+    }
 
-    releaseModelLocked();
+    private fun sendMessage() {
+        val question = input.text.toString().trim()
+        if (question.isEmpty() || busy) return
 
-    LOGI("Модель выгружена");
+        if (!modelLoaded) {
+            status.text = "Сначала загрузите модель"
+            return
+        }
+
+        input.setText("")
+        try {
+            val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            manager.hideSoftInputFromWindow(input.windowToken, 0)
+        } catch (_: Exception) {}
+
+        messages.add("Вы" to question)
+        trimHistory()
+        renderChat()
+        saveHistory()
+
+        val prompt = buildPrompt()
+        busy = true
+        setControls(false)
+        status.text = "RAMZES AI генерирует ответ..."
+
+        val resultRef = AtomicReference<String>(
+            "Превышено время ожидания (30 сек). Модель зависла или не хватает памяти."
+        )
+
+        generateThread = thread(name = "ramzes-generate") {
+            val worker = thread {
+                try {
+                    android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
+                    val result = nativeGenerate(prompt, MAX_TOKENS).trim()
+                    android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
+                    resultRef.set(if (result.isBlank()) "Модель вернула пустой ответ." else result)
+                } catch (e: Throwable) {
+                    resultRef.set("Ошибка генерации: ${e.message ?: e.javaClass.simpleName}")
+                    e.printStackTrace()
+                }
+            }
+
+            worker.join(GENERATION_TIMEOUT_MS)
+
+            if (worker.isAlive) {
+                android.util.Log.e("RAMZES", "Таймаут! Модель зависла внутри llama_decode.")
+                worker.interrupt()
+            }
+
+            val finalAnswer = resultRef.get()
+
+            runOnUiThread {
+                if (!destroyed) {
+                    messages.add("RAMZES AI" to finalAnswer)
+                    trimHistory()
+                    renderChat()
+                    saveHistory()
+                    status.text = if (finalAnswer.contains("Превышено время")) "Таймаут" else "Готово"
+                    setControls(true)
+                }
+                busy = false
+                generateThread = null
+            }
+        }
+    }
+
+    private fun trimHistory() {
+        while (messages.size > MAX_HISTORY) messages.removeAt(0)
+    }
+
+    private fun renderChat() {
+        chat.text = messages.joinToString("\n\n") { (speaker, text) ->
+            "$speaker:\n$text"
+        }
+        scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+    }
+
+    private fun saveHistory() {
+        try {
+            val array = JSONArray()
+            messages.forEach { (speaker, text) ->
+                array.put(JSONObject().put("speaker", speaker).put("message", text))
+            }
+            prefs.edit().putString("messages", array.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun restoreHistory() {
+        try {
+            val array = JSONArray(prefs.getString("messages", "[]") ?: "[]")
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val speaker = item.optString("speaker")
+                val text = item.optString("message")
+                if (speaker.isNotBlank() && text.isNotBlank()) {
+                    messages.add(speaker to text)
+                }
+            }
+            trimHistory()
+        } catch (_: Exception) {
+            messages.clear()
+        }
+        renderChat()
+    }
+
+    private fun setControls(enabled: Boolean) {
+        if (destroyed) return
+        sendButton.isEnabled = enabled
+        modelButton.isEnabled = enabled
+        input.isEnabled = enabled
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        val t = generateThread
+        if (t != null && t.isAlive) {
+            try {
+                t.join(2000)
+            } catch (_: InterruptedException) {}
+        }
+        try {
+            nativeUnloadModel()
+        } catch (_: Throwable) {}
+        super.onDestroy()
+    }
 }
