@@ -1,6 +1,5 @@
 package com.ramzes.ai
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -12,6 +11,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import org.json.JSONArray
 import org.json.JSONObject
@@ -20,7 +20,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import kotlin.concurrent.thread
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var chat: TextView
     private lateinit var input: EditText
@@ -42,7 +42,6 @@ class MainActivity : Activity() {
     }
 
     companion object {
-        // Увеличенные лимиты для нормальной работы модели
         private const val CONTEXT_SIZE = 2048
         private const val MAX_TOKENS = 256
         private const val MAX_HISTORY = 20
@@ -52,7 +51,6 @@ class MainActivity : Activity() {
             try {
                 System.loadLibrary("ramzes_native")
             } catch (e: UnsatisfiedLinkError) {
-                // Ошибка загрузки библиотеки будет обработана при первом вызове
                 e.printStackTrace()
             }
         }
@@ -75,8 +73,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         createUi()
         restoreHistory()
-        
-        // Если модель уже была загружена (после поворота экрана), статус обновится
+
         status.text = if (modelLoaded) "Модель загружена" else "Выберите GGUF-модель"
         setControls(!busy)
     }
@@ -140,7 +137,6 @@ class MainActivity : Activity() {
     private fun chooseModel() {
         if (busy) return
         try {
-            // Фильтр по типу файла: gguf обычно определяется как application/octet-stream
             pickModelLauncher.launch(arrayOf("*/*"))
         } catch (e: Exception) {
             status.text = "Не удалось открыть файл: ${e.message}"
@@ -166,7 +162,7 @@ class MainActivity : Activity() {
                 }
 
                 result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
-            } catch (e: Throwable) { // Ловим и OOM (OutOfMemoryError)
+            } catch (e: Throwable) {
                 result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
                 e.printStackTrace()
             }
@@ -175,11 +171,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (!destroyed) {
                     modelLoaded = finalResult == "OK"
-                    status.text = if (modelLoaded) {
-                        "Модель загружена"
-                    } else {
-                        finalResult
-                    }
+                    status.text = if (modelLoaded) "Модель загружена" else finalResult
                     setControls(true)
                 }
                 busy = false
@@ -247,7 +239,6 @@ class MainActivity : Activity() {
     }
 
     private fun buildPrompt(): String {
-        // Берем последние сообщения, но ограничиваем их количество
         val recent = messages.takeLast(PROMPT_HISTORY)
 
         return buildString {
@@ -294,12 +285,11 @@ class MainActivity : Activity() {
         generateThread = thread(name = "ramzes-generate") {
             val answer = try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
-                
-                // Добавляем логирование в Logcat для отладки
+
                 android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
-                
+
                 val result = nativeGenerate(prompt, MAX_TOKENS).trim()
-                
+
                 android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
 
                 if (result.isBlank()) {
@@ -378,21 +368,18 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         destroyed = true
-        
-        // Ждём завершения генерации, чтобы не выгружать модель во время работы C++ кода
+
         val t = generateThread
         if (t != null && t.isAlive) {
             try {
-                // Ждем максимум 2 секунды, чтобы не вешать UI
                 t.join(2000)
             } catch (_: InterruptedException) {}
         }
-        
-        // Выгружаем модель, чтобы освободить оперативную память
+
         try {
             nativeUnloadModel()
         } catch (_: Throwable) {}
-        
+
         super.onDestroy()
     }
 }
