@@ -67,13 +67,13 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Не удалось загрузить модель.");
     }
 
-    // ПАРАМЕТРЫ ДЛЯ СТАБИЛЬНОСТИ
+    // ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ
     llama_context_params contextParams = llama_context_default_params();
     contextParams.n_ctx = 512;       // Контекст
-    contextParams.n_batch = 128;     // Меньше n_ctx (избегаем переполнения)
-    contextParams.n_ubatch = 128;    // Равен n_batch (обязательное условие)
-    contextParams.n_threads = 1;     // 1 поток для исключения race condition
-    contextParams.n_threads_batch = 1;
+    contextParams.n_batch = 128;     // Умеренный батч
+    contextParams.n_ubatch = 128;    
+    contextParams.n_threads = 2;     // 2 потока - оптимально для ARM
+    contextParams.n_threads_batch = 2;
 
     g_context = llama_init_from_model(g_model, contextParams);
     if (g_context == nullptr) {
@@ -88,7 +88,7 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Ошибка сэмплера");
     }
 
-    LOGI("Модель загружена. Контекст=512, Потоков=1, Batch=128");
+    LOGI("Модель загружена. Контекст=512, Batch=128, Потоков=2");
     return makeJavaString(env, "OK");
 }
 
@@ -109,7 +109,7 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     LOGI("--- СТАРТ ГЕНЕРАЦИИ ---");
     const llama_vocab *vocab = llama_model_get_vocab(g_model);
     
-    // Токенизация
+    // 1. Токенизация
     int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), nullptr, 0, true, true);
     if (n_tokens < 0) n_tokens = -n_tokens;
     
@@ -121,36 +121,35 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     }
     LOGI("Промпт разбит на %d токенов", n_tokens);
 
-    // Проверка на переполнение контекста
     if (n_tokens >= 500) {
         return makeJavaString(env, "Промпт слишком длинный для контекста 512.");
     }
 
-    // Очистка памяти и сэмплера
+    // 2. Очистка памяти и сэмплера
     llama_memory_clear(llama_get_memory(g_context), true);
     llama_sampler_reset(g_sampler);
 
-    // ДЕКОДИРОВАНИЕ ПРОМПТА ПО ОДНОМУ ТОКЕНУ
-    LOGI("Начинаем обработку промпта по одному токену...");
+    // 3. ДЕКОДИРОВАНИЕ ПРОМПТА ОДНИМ БАТЧЕМ (исправление ошибки -1)
+    LOGI("Начинаем обработку промпта...");
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
-        llama_batch batch = llama_batch_init(1, 0, 1);
-        batch.token[0] = tokens[i];
-        batch.pos[0] = i;
-        batch.n_seq_id[0] = 1;
-        batch.seq_id[0][0] = 0;
-        batch.logits[0] = (i == n_tokens - 1);
+        batch.token[i] = tokens[i];
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == n_tokens - 1); 
+    }
 
-        int res = llama_decode(g_context, batch);
-        llama_batch_free(batch);
-        
-        if (res != 0) {
-            LOGE("Ошибка llama_decode на токене %d, код: %d", i, res);
-            return makeJavaString(env, "Ошибка обработки промпта (decode " + std::to_string(res) + ")");
-        }
+    int res = llama_decode(g_context, batch);
+    llama_batch_free(batch);
+
+    if (res != 0) {
+        LOGE("Ошибка llama_decode на промпте, код: %d", res);
+        return makeJavaString(env, "Ошибка обработки промпта (decode " + std::to_string(res) + ")");
     }
     LOGI("Промпт успешно обработан.");
 
-    // ГЕНЕРАЦИЯ
+    // 4. ГЕНЕРАЦИЯ
     std::string answer;
     int n_past = n_tokens;
     int limit = std::min((int)maxTokens, 128);
