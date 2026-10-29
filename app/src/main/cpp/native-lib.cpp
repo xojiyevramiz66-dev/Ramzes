@@ -70,9 +70,9 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
     // ПАРАМЕТРЫ ДЛЯ СТАБИЛЬНОСТИ
     llama_context_params contextParams = llama_context_default_params();
     contextParams.n_ctx = 512;       // Контекст
-    contextParams.n_batch = 512;     // ВАЖНО: Нормальный батч (512 вместо 1)
-    contextParams.n_ubatch = 512;    // ВАЖНО: Должен быть равен n_batch
-    contextParams.n_threads = 1;     // 1 поток (исключает race condition)
+    contextParams.n_batch = 128;     // Меньше n_ctx (избегаем переполнения)
+    contextParams.n_ubatch = 128;    // Равен n_batch (обязательное условие)
+    contextParams.n_threads = 1;     // 1 поток для исключения race condition
     contextParams.n_threads_batch = 1;
 
     g_context = llama_init_from_model(g_model, contextParams);
@@ -88,7 +88,7 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Ошибка сэмплера");
     }
 
-    LOGI("Модель загружена. Контекст=512, Потоков=1, Batch=512");
+    LOGI("Модель загружена. Контекст=512, Потоков=1, Batch=128");
     return makeJavaString(env, "OK");
 }
 
@@ -121,11 +121,16 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     }
     LOGI("Промпт разбит на %d токенов", n_tokens);
 
+    // Проверка на переполнение контекста
+    if (n_tokens >= 500) {
+        return makeJavaString(env, "Промпт слишком длинный для контекста 512.");
+    }
+
     // Очистка памяти и сэмплера
     llama_memory_clear(llama_get_memory(g_context), true);
     llama_sampler_reset(g_sampler);
 
-    // ПОШАГОВОЕ ДЕКОДИРОВАНИЕ ПРОМПТА
+    // ДЕКОДИРОВАНИЕ ПРОМПТА ПО ОДНОМУ ТОКЕНУ
     LOGI("Начинаем обработку промпта по одному токену...");
     for (int i = 0; i < n_tokens; i++) {
         llama_batch batch = llama_batch_init(1, 0, 1);
@@ -133,7 +138,7 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         batch.pos[0] = i;
         batch.n_seq_id[0] = 1;
         batch.seq_id[0][0] = 0;
-        batch.logits[0] = (i == n_tokens - 1); // Логиты только на последнем токене
+        batch.logits[0] = (i == n_tokens - 1);
 
         int res = llama_decode(g_context, batch);
         llama_batch_free(batch);
