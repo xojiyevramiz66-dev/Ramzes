@@ -1,4 +1,3 @@
-
 #include <jni.h>
 #include <android/log.h>
 
@@ -15,33 +14,44 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-static llama_model *g_model = nullptr;
-static llama_context *g_context = nullptr;
-static llama_sampler *g_sampler = nullptr;
+namespace {
 
-static std::mutex g_mutex;
+std::mutex g_mutex;
 
-static constexpr int32_t CONTEXT_SIZE = 1024;
-static constexpr int32_t BATCH_SIZE = 64;
-static constexpr int32_t MAX_PROMPT_TOKENS = 768;
-static constexpr int32_t MAX_GENERATION_TOKENS = 64;
+llama_model *g_model = nullptr;
+llama_context *g_context = nullptr;
+llama_sampler *g_sampler = nullptr;
 
-static std::string jstringToString(JNIEnv *env, jstring value) {
-    if (value == nullptr) return {};
+bool g_backend_initialized = false;
+
+constexpr int32_t DEFAULT_CONTEXT_SIZE = 1024;
+constexpr int32_t BATCH_SIZE = 64;
+constexpr int32_t MAX_PROMPT_TOKENS = 768;
+constexpr int32_t MAX_GENERATION_TOKENS = 64;
+constexpr int32_t THREAD_COUNT = 4;
+
+std::string jstringToString(JNIEnv *env, jstring value) {
+    if (value == nullptr) {
+        return {};
+    }
 
     const char *chars = env->GetStringUTFChars(value, nullptr);
-    if (chars == nullptr) return {};
+
+    if (chars == nullptr) {
+        return {};
+    }
 
     std::string result(chars);
     env->ReleaseStringUTFChars(value, chars);
+
     return result;
 }
 
-static jstring makeJavaString(JNIEnv *env, const std::string &value) {
+jstring makeJavaString(JNIEnv *env, const std::string &value) {
     return env->NewStringUTF(value.c_str());
 }
 
-static void releaseModelLocked() {
+void releaseModelLocked() {
     if (g_sampler != nullptr) {
         llama_sampler_free(g_sampler);
         g_sampler = nullptr;
@@ -58,15 +68,32 @@ static void releaseModelLocked() {
     }
 }
 
-static bool tokenizePrompt(
+/*
+ * llama_tokenize возвращает отрицательное число,
+ * когда переданный буфер слишком мал.
+ */
+bool tokenizePrompt(
     const llama_vocab *vocab,
     const std::string &prompt,
     std::vector<llama_token> &tokens
 ) {
-    const int32_t required = llama_tokenize(
+    if (vocab == nullptr || prompt.empty()) {
+        LOGE("Пустой промпт или словарь модели");
+        return false;
+    }
+
+    if (prompt.size() > static_cast<size_t>(INT32_MAX)) {
+        LOGE("Промпт слишком велик");
+        return false;
+    }
+
+    const int32_t promptLength =
+        static_cast<int32_t>(prompt.size());
+
+    int32_t required = llama_tokenize(
         vocab,
         prompt.c_str(),
-        static_cast<int32_t>(prompt.size()),
+        promptLength,
         nullptr,
         0,
         true,
@@ -74,11 +101,14 @@ static bool tokenizePrompt(
     );
 
     if (required >= 0) {
+        // Для пустого буфера ожидается отрицательный размер.
+        // Если API вернул ноль, не продолжаем с пустым контекстом.
         LOGE("Не удалось определить размер токенизации: %d", required);
         return false;
     }
 
     const int32_t capacity = -required;
+
     if (capacity <= 0 || capacity > 100000) {
         LOGE("Недопустимый размер токенизации: %d", capacity);
         return false;
@@ -89,7 +119,7 @@ static bool tokenizePrompt(
     const int32_t actual = llama_tokenize(
         vocab,
         prompt.c_str(),
-        static_cast<int32_t>(prompt.size()),
+        promptLength,
         tokens.data(),
         capacity,
         true,
@@ -98,28 +128,47 @@ static bool tokenizePrompt(
 
     if (actual < 0) {
         LOGE("Ошибка токенизации: %d", actual);
+        tokens.clear();
         return false;
     }
 
     tokens.resize(static_cast<size_t>(actual));
-    return !tokens.empty();
+
+    if (tokens.empty()) {
+        LOGE("После токенизации не осталось токенов");
+        return false;
+    }
+
+    return true;
 }
 
-static bool decodePromptInBatches(
+/*
+ * Обрабатываем промпт небольшими батчами, чтобы не требовать
+ * большой временный буфер для всего запроса сразу.
+ */
+bool decodePromptInBatches(
     llama_context *context,
     const std::vector<llama_token> &tokens
 ) {
+    if (context == nullptr || tokens.empty()) {
+        return false;
+    }
+
     const int32_t total = static_cast<int32_t>(tokens.size());
 
     for (int32_t offset = 0; offset < total; offset += BATCH_SIZE) {
-        const int32_t count = std::min(BATCH_SIZE, total - offset);
+        const int32_t count =
+            std::min(BATCH_SIZE, total - offset);
+
         llama_batch batch = llama_batch_init(count, 0, 1);
 
-        if (batch.token == nullptr ||
+        if (
+            batch.token == nullptr ||
             batch.pos == nullptr ||
             batch.n_seq_id == nullptr ||
             batch.seq_id == nullptr ||
-            batch.logits == nullptr) {
+            batch.logits == nullptr
+        ) {
             LOGE("Не удалось выделить память для батча");
             llama_batch_free(batch);
             return false;
@@ -130,27 +179,42 @@ static bool decodePromptInBatches(
         for (int32_t j = 0; j < count; ++j) {
             const int32_t index = offset + j;
 
-            batch.token[j] = tokens[index];
-            batch.pos[j] = index;
+            batch.token[j] = tokens[static_cast<size_t>(index)];
+            batch.pos[j] = static_cast<llama_pos>(index);
             batch.n_seq_id[j] = 1;
             batch.seq_id[j][0] = 0;
+
+            // Логиты нужны только для последнего токена промпта.
             batch.logits[j] = (index == total - 1);
         }
 
-        LOGI("Обработка промпта: %d/%d токенов",
-             std::min(offset + count, total), total);
-
         const int result = llama_decode(context, batch);
+
         llama_batch_free(batch);
 
         if (result != 0) {
-            LOGE("llama_decode: ошибка %d на позиции %d", result, offset);
+            LOGE(
+                "llama_decode завершился с ошибкой %d на позиции %d",
+                result,
+                offset
+            );
             return false;
         }
     }
 
     return true;
 }
+
+bool initializeBackend() {
+    if (!g_backend_initialized) {
+        llama_backend_init();
+        g_backend_initialized = true;
+    }
+
+    return true;
+}
+
+} // namespace
 
 extern "C"
 JNIEXPORT jstring JNICALL
@@ -162,62 +226,113 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
 ) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // Удаляем предыдущую модель перед новой загрузкой.
     releaseModelLocked();
 
     const std::string path = jstringToString(env, modelPath);
+
     if (path.empty()) {
-        return makeJavaString(env, "ERROR: Путь к модели пуст");
-    }
-
-    LOGI("Начало загрузки модели: %s", path.c_str());
-    LOGI("Запрошенный контекст: %d", requestedContext);
-
-    llama_backend_init();
-
-    llama_model_params modelParams = llama_model_default_params();
-    modelParams.n_gpu_layers = 0;
-
-    g_model = llama_model_load_from_file(path.c_str(), modelParams);
-    if (g_model == nullptr) {
-        LOGE("Не удалось загрузить GGUF-модель");
-        releaseModelLocked();
         return makeJavaString(
             env,
-            "ERROR: Не удалось загрузить модель. Проверьте GGUF и Logcat."
+            "ERROR: Путь к модели пуст."
         );
     }
 
-    const int32_t n_ctx = std::max(
-        512,
-        std::min(static_cast<int32_t>(requestedContext), CONTEXT_SIZE)
-    );
+    LOGI("Загрузка модели: %s", path.c_str());
 
-    llama_context_params contextParams = llama_context_default_params();
-    contextParams.n_ctx = n_ctx;
-    contextParams.n_batch = BATCH_SIZE;
-    contextParams.n_ubatch = BATCH_SIZE;
-    contextParams.n_threads = 4;
-    contextParams.n_threads_batch = 4;
+    try {
+        initializeBackend();
 
-    g_context = llama_init_from_model(g_model, contextParams);
-    if (g_context == nullptr) {
-        LOGE("Не удалось создать llama_context");
+        llama_model_params modelParams =
+            llama_model_default_params();
+
+        // CPU-режим — наиболее предсказуемый вариант для Android.
+        modelParams.n_gpu_layers = 0;
+
+        g_model = llama_model_load_from_file(
+            path.c_str(),
+            modelParams
+        );
+
+        if (g_model == nullptr) {
+            LOGE("Не удалось загрузить модель из файла");
+
+            releaseModelLocked();
+
+            return makeJavaString(
+                env,
+                "ERROR: Не удалось загрузить модель. " 
+                "Проверьте файл GGUF и свободную память."
+            );
+        }
+
+        int32_t contextSize = requestedContext;
+
+        if (contextSize <= 0) {
+            contextSize = DEFAULT_CONTEXT_SIZE;
+        }
+
+        contextSize = std::max(
+            512,
+            std::min(contextSize, DEFAULT_CONTEXT_SIZE)
+        );
+
+        llama_context_params contextParams =
+            llama_context_default_params();
+
+        contextParams.n_ctx = static_cast<uint32_t>(contextSize);
+        contextParams.n_batch = BATCH_SIZE;
+        contextParams.n_ubatch = BATCH_SIZE;
+        contextParams.n_threads = THREAD_COUNT;
+        contextParams.n_threads_batch = THREAD_COUNT;
+
+        g_context = llama_init_from_model(
+            g_model,
+            contextParams
+        );
+
+        if (g_context == nullptr) {
+            LOGE("Не удалось создать контекст");
+
+            releaseModelLocked();
+
+            return makeJavaString(
+                env,
+                "ERROR: Не удалось создать контекст. "
+                "Попробуйте меньшую модель."
+            );
+        }
+
+        g_sampler = llama_sampler_init_greedy();
+
+        if (g_sampler == nullptr) {
+            LOGE("Не удалось создать sampler");
+
+            releaseModelLocked();
+
+            return makeJavaString(
+                env,
+                "ERROR: Не удалось создать генератор токенов."
+            );
+        }
+
+        LOGI(
+            "Модель загружена. Контекст=%d, batch=%d",
+            contextSize,
+            BATCH_SIZE
+        );
+
+        return makeJavaString(env, "OK");
+    } catch (...) {
+        LOGE("Неизвестная ошибка во время загрузки модели");
+
         releaseModelLocked();
+
         return makeJavaString(
             env,
-            "ERROR: Не удалось создать контекст. Проверьте память устройства."
+            "ERROR: Исключение при загрузке модели."
         );
     }
-
-    g_sampler = llama_sampler_init_greedy();
-    if (g_sampler == nullptr) {
-        LOGE("Не удалось создать sampler");
-        releaseModelLocked();
-        return makeJavaString(env, "ERROR: Не удалось создать sampler");
-    }
-
-    LOGI("Модель загружена; контекст=%d, батч=%d", n_ctx, BATCH_SIZE);
-    return makeJavaString(env, "OK");
 }
 
 extern "C"
@@ -230,63 +345,112 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
 ) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    if (g_model == nullptr || g_context == nullptr || g_sampler == nullptr) {
-        return makeJavaString(env, "Ошибка: модель не загружена.");
+    if (
+        g_model == nullptr ||
+        g_context == nullptr ||
+        g_sampler == nullptr
+    ) {
+        return makeJavaString(
+            env,
+            "Ошибка: модель не загружена."
+        );
     }
 
     const std::string prompt = jstringToString(env, userPrompt);
+
     if (prompt.empty()) {
         return makeJavaString(env, "Введите сообщение.");
     }
 
     const auto start = std::chrono::steady_clock::now();
+
     LOGI("Начало генерации");
 
-    const llama_vocab *vocab = llama_model_get_vocab(g_model);
+    const llama_vocab *vocab =
+        llama_model_get_vocab(g_model);
+
     std::vector<llama_token> tokens;
 
     if (!tokenizePrompt(vocab, prompt, tokens)) {
-        return makeJavaString(env, "Ошибка токенизации промпта.");
+        return makeJavaString(
+            env,
+            "Ошибка токенизации промпта."
+        );
     }
 
     if (tokens.size() > MAX_PROMPT_TOKENS) {
-        LOGE("Слишком длинный промпт: %zu токенов", tokens.size());
+        LOGE(
+            "Промпт слишком длинный: %zu токенов",
+            tokens.size()
+        );
+
         return makeJavaString(
             env,
-            "Сообщение слишком длинное. Сократите историю или запрос."
+            "Запрос слишком длинный. "
+            "Сократите сообщение или историю чата."
+        );
+    }
+
+    const int32_t generationLimit = std::max(
+        1,
+        std::min(
+            static_cast<int32_t>(maxTokens),
+            MAX_GENERATION_TOKENS
+        )
+    );
+
+    /*
+     * Проверяем, что промпт и генерация помещаются в контекст.
+     * Не начинаем генерацию, если позиции токенов превысят лимит.
+     */
+    const uint32_t contextSize = llama_n_ctx(g_context);
+
+    if (
+        tokens.size() + static_cast<size_t>(generationLimit)
+        > static_cast<size_t>(contextSize)
+    ) {
+        return makeJavaString(
+            env,
+            "Недостаточно места в контексте. "
+            "Сократите историю сообщений."
         );
     }
 
     llama_memory_t memory = llama_get_memory(g_context);
+
     if (memory != nullptr) {
         llama_memory_clear(memory, true);
     }
 
+    // Сбрасываем состояние sampler перед каждым новым ответом.
+    llama_sampler_reset(g_sampler);
+
     if (!decodePromptInBatches(g_context, tokens)) {
+        if (memory != nullptr) {
+            llama_memory_clear(memory, true);
+        }
+
         return makeJavaString(
             env,
-            "Ошибка обработки промпта. Проверьте Logcat."
+            "Ошибка обработки промпта. Проверьте версию llama.cpp."
         );
     }
 
-    const int32_t limit = std::max(
-        1,
-        std::min(static_cast<int32_t>(maxTokens), MAX_GENERATION_TOKENS)
-    );
-
     std::string answer;
-    answer.reserve(static_cast<size_t>(limit) * 8);
+    answer.reserve(static_cast<size_t>(generationLimit) * 8);
 
-    for (int32_t i = 0; i < limit; ++i) {
+    bool decodeFailed = false;
+
+    for (int32_t i = 0; i < generationLimit; ++i) {
         const llama_token token =
             llama_sampler_sample(g_sampler, g_context, -1);
 
-        llama_sampler_accept(g_sampler, token);
-
         if (llama_vocab_is_eog(vocab, token)) {
-            LOGI("Конец ответа на токене %d", i);
+            LOGI("Модель завершила ответ на токене %d", i);
             break;
         }
+
+        llama_sampler_accept(g_sampler, token);
 
         char piece[4096];
 
@@ -294,46 +458,65 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
             vocab,
             token,
             piece,
-            sizeof(piece),
+            static_cast<int32_t>(sizeof(piece)),
             0,
             true
         );
 
         if (pieceSize < 0) {
             LOGE("Ошибка преобразования токена: %d", pieceSize);
+            decodeFailed = true;
             break;
         }
 
         if (pieceSize > 0) {
-            answer.append(piece, static_cast<size_t>(pieceSize));
+            answer.append(
+                piece,
+                static_cast<size_t>(pieceSize)
+            );
         }
 
-        if (i + 1 >= limit) break;
+        // Для последнего токена следующий decode не нужен.
+        if (i + 1 >= generationLimit) {
+            break;
+        }
 
         llama_batch next = llama_batch_init(1, 0, 1);
 
-        if (next.token == nullptr ||
+        if (
+            next.token == nullptr ||
             next.pos == nullptr ||
             next.n_seq_id == nullptr ||
             next.seq_id == nullptr ||
-            next.logits == nullptr) {
+            next.logits == nullptr
+        ) {
             LOGE("Не удалось выделить батч для генерации");
             llama_batch_free(next);
+            decodeFailed = true;
             break;
         }
 
         next.n_tokens = 1;
         next.token[0] = token;
-        next.pos[0] = static_cast<llama_pos>(tokens.size() + i);
+        next.pos[0] = static_cast<llama_pos>(
+            tokens.size() + static_cast<size_t>(i)
+        );
         next.n_seq_id[0] = 1;
         next.seq_id[0][0] = 0;
         next.logits[0] = true;
 
         const int result = llama_decode(g_context, next);
+
         llama_batch_free(next);
 
         if (result != 0) {
-            LOGE("Ошибка декодирования токена %d: %d", i, result);
+            LOGE(
+                "Ошибка декодирования токена %d: %d",
+                i,
+                result
+            );
+
+            decodeFailed = true;
             break;
         }
     }
@@ -343,13 +526,28 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
             std::chrono::steady_clock::now() - start
         ).count();
 
-    LOGI("Генерация завершена: %zu байт, время=%lld мс",
-         answer.size(), static_cast<long long>(elapsed));
+    LOGI(
+        "Генерация завершена: %zu байт, %lld мс",
+        answer.size(),
+        static_cast<long long>(elapsed)
+    );
+
+    if (decodeFailed && answer.empty()) {
+        if (memory != nullptr) {
+            llama_memory_clear(memory, true);
+        }
+
+        return makeJavaString(
+            env,
+            "Ошибка генерации. Проверьте Logcat и версию llama.cpp."
+        );
+    }
 
     if (answer.empty()) {
         return makeJavaString(
             env,
-            "Модель не вернула текст. Проверьте Logcat и шаблон чата."
+            "Модель не вернула текст. "
+            "Проверьте совместимость шаблона чата."
         );
     }
 
@@ -363,6 +561,8 @@ Java_com_ramzes_ai_MainActivity_nativeUnloadModel(
     jobject /* thiz */
 ) {
     std::lock_guard<std::mutex> lock(g_mutex);
+
     releaseModelLocked();
+
     LOGI("Модель освобождена");
 }
