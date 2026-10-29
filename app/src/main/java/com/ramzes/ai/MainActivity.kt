@@ -1,7 +1,6 @@
 package com.ramzes.ai
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
@@ -18,6 +17,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
@@ -34,7 +34,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var busy = false
     @Volatile private var destroyed = false
 
-    // Поток для генерации, чтобы можно было его дождаться при выходе
+    // Поток для генерации
     private var generateThread: Thread? = null
 
     private val prefs by lazy {
@@ -42,10 +42,11 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val CONTEXT_SIZE = 2048
-        private const val MAX_TOKENS = 256
+        private const val CONTEXT_SIZE = 512 // Уменьшено для стабильности на телефонах
+        private const val MAX_TOKENS = 64     // Уменьшено, чтобы избежать долгого зависания
         private const val MAX_HISTORY = 20
-        private const val PROMPT_HISTORY = 8
+        private const val PROMPT_HISTORY = 4  // Меньше истории = меньше нагрузка на контекст
+        private const val GENERATION_TIMEOUT_MS = 30000L // 30 секунд максимум
 
         init {
             try {
@@ -60,7 +61,6 @@ class MainActivity : ComponentActivity() {
     private external fun nativeGenerate(prompt: String, maxTokens: Int): String
     private external fun nativeUnloadModel()
 
-    // Современный API выбора файла
     private val pickModelLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -282,32 +282,45 @@ class MainActivity : ComponentActivity() {
         setControls(false)
         status.text = "RAMZES AI генерирует ответ..."
 
+        val resultRef = AtomicReference<String>("Превышено время ожидания (30 сек). Модель зависла или не хватает памяти.")
+
         generateThread = thread(name = "ramzes-generate") {
-            val answer = try {
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
-
-                android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
-
-                val result = nativeGenerate(prompt, MAX_TOKENS).trim()
-
-                android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
-
-                if (result.isBlank()) {
-                    "Модель вернула пустой ответ. Проверьте Logcat."
-                } else {
-                    result
+            // Запускаем нативную генерацию в отдельном потоке
+            val worker = thread {
+                try {
+                    android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
+                    val result = nativeGenerate(prompt, MAX_TOKENS).trim()
+                    android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
+                    
+                    if (result.isBlank()) {
+                        resultRef.set("Модель вернула пустой ответ. Проверьте Logcat.")
+                    } else {
+                        resultRef.set(result)
+                    }
+                } catch (e: Throwable) {
+                    resultRef.set("Ошибка генерации: ${e.message ?: e.javaClass.simpleName}")
+                    e.printStackTrace()
                 }
-            } catch (e: Throwable) {
-                "Ошибка генерации: ${e.message ?: e.javaClass.simpleName}"
             }
+
+            // Ждем завершения максимум 30 секунд
+            worker.join(GENERATION_TIMEOUT_MS)
+
+            if (worker.isAlive) {
+                android.util.Log.e("RAMZES", "Таймаут генерации! Модель зависла.")
+                worker.interrupt()
+                // Примечание: нативный C++ код не прервется, но UI мы разблокируем
+            }
+
+            val finalAnswer = resultRef.get()
 
             runOnUiThread {
                 if (!destroyed) {
-                    messages.add("RAMZES AI" to answer)
+                    messages.add("RAMZES AI" to finalAnswer)
                     trimHistory()
                     renderChat()
                     saveHistory()
-                    status.text = "Готово"
+                    status.text = if (finalAnswer.contains("Превышено время")) "Таймаут" else "Готово"
                     setControls(true)
                 }
                 busy = false
