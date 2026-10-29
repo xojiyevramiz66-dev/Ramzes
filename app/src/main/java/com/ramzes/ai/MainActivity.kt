@@ -110,13 +110,9 @@ class MainActivity : Activity() {
 
         scrollView = ScrollView(this).apply {
             isFillViewport = true
-            addView(
-                chat,
-                ScrollView.LayoutParams(
-                    ScrollView.LayoutParams.MATCH_PARENT,
-                    ScrollView.LayoutParams.WRAP_CONTENT
-                )
-            )
+
+            // Исправление ошибки Unresolved reference: LayoutParams.
+            addView(chat)
         }
 
         input = EditText(this).apply {
@@ -153,11 +149,7 @@ class MainActivity : Activity() {
 
         root.addView(
             scrollView,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
+            LinearLayout.LayoutParams(-1, 0, 1f)
         )
 
         root.addView(bottom)
@@ -213,8 +205,6 @@ class MainActivity : Activity() {
         showStatus("Импорт GGUF-модели...")
 
         thread(name = "ramzes-model-loader") {
-            var loaded = false
-
             try {
                 val modelFile = copyModel(uri)
 
@@ -233,7 +223,7 @@ class MainActivity : Activity() {
                     CONTEXT_SIZE
                 )
 
-                loaded = result == "OK"
+                val loaded = result == "OK"
 
                 runOnUiThread {
                     if (!activityDestroyed) {
@@ -252,10 +242,8 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (!activityDestroyed) {
                         modelLoaded = false
-
                         status.text =
                             "Ошибка загрузки: ${errorMessage(e)}"
-
                         setControlsEnabled(true)
                     }
                 }
@@ -265,11 +253,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Копирует модель сначала во временный файл.
-     * Существующая модель на диске не удаляется,
-     * пока новая не скопирована успешно.
-     */
     private fun copyModel(uri: Uri): File {
         val directory = File(filesDir, "models")
 
@@ -279,6 +262,7 @@ class MainActivity : Activity() {
 
         val destination = File(directory, "ramzes_model.gguf")
         val temporary = File(directory, "ramzes_model.tmp")
+        val backup = File(directory, "ramzes_model.bak")
 
         try {
             val source = contentResolver.openInputStream(uri)
@@ -295,51 +279,51 @@ class MainActivity : Activity() {
                 throw IOException("Выбран пустой файл.")
             }
 
-            // Проверка расширения помогает избежать выбора случайного файла.
-            // Фактическая проверка формата GGUF выполняется нативной библиотекой.
             val displayName = queryDisplayName(uri)
+
             if (
                 displayName != null &&
                 !displayName.endsWith(".gguf", ignoreCase = true)
             ) {
-                throw IOException("Выберите файл модели с расширением .gguf.")
+                throw IOException(
+                    "Выберите файл модели с расширением .gguf."
+                )
             }
 
-            // Замена выполняется после успешного копирования.
-            // Сохраняем резервную копию на случай ошибки переименования.
-            val backup = File(directory, "ramzes_model.bak")
             var backupCreated = false
 
             if (destination.exists()) {
                 if (backup.exists() && !backup.delete()) {
-                    throw IOException("Не удалось удалить старую резервную копию.")
+                    throw IOException(
+                        "Не удалось удалить старую резервную копию."
+                    )
                 }
 
                 if (!destination.renameTo(backup)) {
-                    throw IOException("Не удалось сохранить предыдущую модель.")
+                    throw IOException(
+                        "Не удалось сохранить предыдущую модель."
+                    )
                 }
 
                 backupCreated = true
             }
 
-            val installed = temporary.renameTo(destination)
-
-            if (!installed) {
-                try {
+            try {
+                if (!temporary.renameTo(destination)) {
                     temporary.copyTo(destination, overwrite = true)
                     temporary.delete()
-                } catch (e: Exception) {
-                    destination.delete()
-
-                    if (backupCreated) {
-                        backup.renameTo(destination)
-                    }
-
-                    throw IOException(
-                        "Не удалось сохранить новую модель.",
-                        e
-                    )
                 }
+            } catch (e: Exception) {
+                destination.delete()
+
+                if (backupCreated) {
+                    backup.renameTo(destination)
+                }
+
+                throw IOException(
+                    "Не удалось сохранить новую модель.",
+                    e
+                )
             }
 
             if (backupCreated) {
@@ -357,7 +341,9 @@ class MainActivity : Activity() {
         return try {
             contentResolver.query(
                 uri,
-                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                arrayOf(
+                    android.provider.OpenableColumns.DISPLAY_NAME
+                ),
                 null,
                 null,
                 null
@@ -378,7 +364,9 @@ class MainActivity : Activity() {
     }
 
     private fun buildPrompt(): String {
-        val recentMessages = messages.takeLast(PROMPT_HISTORY_MESSAGES)
+        val recentMessages = messages.takeLast(
+            PROMPT_HISTORY_MESSAGES
+        )
 
         return buildString {
             append(
@@ -436,10 +424,13 @@ class MainActivity : Activity() {
 
         thread(name = "ramzes-generation") {
             val answer = try {
-                nativeGenerate(prompt, MAX_GENERATION_TOKENS).trim()
-                    .ifBlank {
-                        "Модель не вернула текст. Проверьте совместимость модели и шаблона чата."
-                    }
+                nativeGenerate(
+                    prompt,
+                    MAX_GENERATION_TOKENS
+                ).trim().ifBlank {
+                    "Модель не вернула текст. " +
+                        "Проверьте совместимость модели и шаблона чата."
+                }
             } catch (e: Exception) {
                 "Ошибка генерации: ${errorMessage(e)}"
             }
@@ -509,7 +500,10 @@ class MainActivity : Activity() {
 
             messages.clear()
 
-            val start = maxOf(0, array.length() - MAX_HISTORY_MESSAGES)
+            val start = maxOf(
+                0,
+                array.length() - MAX_HISTORY_MESSAGES
+            )
 
             for (i in start until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
@@ -539,12 +533,12 @@ class MainActivity : Activity() {
 
             manager.hideSoftInputFromWindow(input.windowToken, 0)
         } catch (_: Exception) {
-            // Закрытие клавиатуры не должно прерывать отправку сообщения.
+            // Ошибка закрытия клавиатуры не прерывает отправку.
         }
     }
 
     private fun showStatus(message: String) {
-        if (!activityDestroyed) {
+        if (!activityDestroyed && ::status.isInitialized) {
             status.text = message
         }
     }
@@ -565,13 +559,13 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         activityDestroyed = true
 
-        // Нативная функция защищена mutex в C++.
-        // Выгрузка запускается вне главного UI-потока.
+        // Выгружаем модель вне UI-потока.
+        // C++ должен защищать операции с моделью через mutex.
         thread(name = "ramzes-model-cleanup") {
             try {
                 nativeUnloadModel()
             } catch (_: Exception) {
-                // При закрытии Activity ошибка очистки не должна приводить к сбою.
+                // Игнорируем ошибку очистки при закрытии экрана.
             }
         }
 
