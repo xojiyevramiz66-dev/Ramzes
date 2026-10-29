@@ -34,7 +34,6 @@ class MainActivity : ComponentActivity() {
     @Volatile private var busy = false
     @Volatile private var destroyed = false
 
-    // Поток для генерации
     private var generateThread: Thread? = null
 
     private val prefs by lazy {
@@ -42,11 +41,11 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val CONTEXT_SIZE = 512 // Уменьшено для стабильности на телефонах
-        private const val MAX_TOKENS = 64     // Уменьшено, чтобы избежать долгого зависания
+        private const val CONTEXT_SIZE = 512
+        private const val MAX_TOKENS = 128
         private const val MAX_HISTORY = 20
-        private const val PROMPT_HISTORY = 4  // Меньше истории = меньше нагрузка на контекст
-        private const val GENERATION_TIMEOUT_MS = 30000L // 30 секунд максимум
+        private const val PROMPT_HISTORY = 2
+        private const val GENERATION_TIMEOUT_MS = 30000L
 
         init {
             try {
@@ -73,7 +72,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         createUi()
         restoreHistory()
-
         status.text = if (modelLoaded) "Модель загружена" else "Выберите GGUF-модель"
         setControls(!busy)
     }
@@ -112,7 +110,6 @@ class MainActivity : ComponentActivity() {
             isFillViewport = true
             addView(chat)
         }
-
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         input = EditText(this).apply {
@@ -152,15 +149,12 @@ class MainActivity : ComponentActivity() {
 
         thread(name = "ramzes-load") {
             var result = "Ошибка загрузки модели"
-
             try {
                 val file = copyModel(uri)
                 if (destroyed) return@thread
-
                 runOnUiThread {
                     if (!destroyed) status.text = "Загрузка модели в память..."
                 }
-
                 result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
             } catch (e: Throwable) {
                 result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
@@ -238,22 +232,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // УПРОЩЁННЫЙ ПРОМПТ: без ChatML, чтобы исключить несовместимость шаблона
     private fun buildPrompt(): String {
         val recent = messages.takeLast(PROMPT_HISTORY)
-
         return buildString {
-            append(
-                "<|im_start|>system\n" +
-                "Ты RAMZES AI, полезный помощник. " +
-                "Отвечай на языке пользователя.\n<|im_end|>\n"
-            )
-
             recent.forEach { (speaker, text) ->
-                val role = if (speaker == "Вы") "user" else "assistant"
-                append("<|im_start|>$role\n$text\n<|im_end|>\n")
+                append("$speaker: $text\n")
             }
-
-            append("<|im_start|>assistant\n")
+            append("RAMZES AI:")
         }
     }
 
@@ -282,34 +268,28 @@ class MainActivity : ComponentActivity() {
         setControls(false)
         status.text = "RAMZES AI генерирует ответ..."
 
-        val resultRef = AtomicReference<String>("Превышено время ожидания (30 сек). Модель зависла или не хватает памяти.")
+        val resultRef = AtomicReference<String>(
+            "Превышено время ожидания (30 сек). Модель зависла или не хватает памяти."
+        )
 
         generateThread = thread(name = "ramzes-generate") {
-            // Запускаем нативную генерацию в отдельном потоке
             val worker = thread {
                 try {
                     android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
                     val result = nativeGenerate(prompt, MAX_TOKENS).trim()
                     android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
-                    
-                    if (result.isBlank()) {
-                        resultRef.set("Модель вернула пустой ответ. Проверьте Logcat.")
-                    } else {
-                        resultRef.set(result)
-                    }
+                    resultRef.set(if (result.isBlank()) "Модель вернула пустой ответ." else result)
                 } catch (e: Throwable) {
                     resultRef.set("Ошибка генерации: ${e.message ?: e.javaClass.simpleName}")
                     e.printStackTrace()
                 }
             }
 
-            // Ждем завершения максимум 30 секунд
             worker.join(GENERATION_TIMEOUT_MS)
 
             if (worker.isAlive) {
-                android.util.Log.e("RAMZES", "Таймаут генерации! Модель зависла.")
+                android.util.Log.e("RAMZES", "Таймаут! Модель зависла внутри llama_decode.")
                 worker.interrupt()
-                // Примечание: нативный C++ код не прервется, но UI мы разблокируем
             }
 
             val finalAnswer = resultRef.get()
@@ -344,11 +324,7 @@ class MainActivity : ComponentActivity() {
         try {
             val array = JSONArray()
             messages.forEach { (speaker, text) ->
-                array.put(
-                    JSONObject()
-                        .put("speaker", speaker)
-                        .put("message", text)
-                )
+                array.put(JSONObject().put("speaker", speaker).put("message", text))
             }
             prefs.edit().putString("messages", array.toString()).apply()
         } catch (_: Exception) {}
@@ -381,18 +357,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         destroyed = true
-
         val t = generateThread
         if (t != null && t.isAlive) {
             try {
                 t.join(2000)
             } catch (_: InterruptedException) {}
         }
-
         try {
             nativeUnloadModel()
         } catch (_: Throwable) {}
-
         super.onDestroy()
     }
 }
