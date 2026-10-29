@@ -67,11 +67,11 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Не удалось загрузить модель.");
     }
 
-    // МИНИМАЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ СТАБИЛЬНОСТИ НА ANDROID
+    // ПАРАМЕТРЫ ДЛЯ СТАБИЛЬНОСТИ
     llama_context_params contextParams = llama_context_default_params();
-    contextParams.n_ctx = 512;       // Маленький контекст
-    contextParams.n_batch = 1;       // БЕЗ БАТЧЕЙ (главная причина зависаний!)
-    contextParams.n_ubatch = 1;
+    contextParams.n_ctx = 512;       // Контекст
+    contextParams.n_batch = 512;     // ВАЖНО: Нормальный батч (512 вместо 1)
+    contextParams.n_ubatch = 512;    // ВАЖНО: Должен быть равен n_batch
     contextParams.n_threads = 1;     // 1 поток (исключает race condition)
     contextParams.n_threads_batch = 1;
 
@@ -88,7 +88,7 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Ошибка сэмплера");
     }
 
-    LOGI("Модель загружена. Контекст=512, Потоков=1, Batch=1");
+    LOGI("Модель загружена. Контекст=512, Потоков=1, Batch=512");
     return makeJavaString(env, "OK");
 }
 
@@ -125,7 +125,7 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     llama_memory_clear(llama_get_memory(g_context), true);
     llama_sampler_reset(g_sampler);
 
-    // ПОШАГОВОЕ ДЕКОДИРОВАНИЕ ПРОМПТА (стабильно, без батчей)
+    // ПОШАГОВОЕ ДЕКОДИРОВАНИЕ ПРОМПТА
     LOGI("Начинаем обработку промпта по одному токену...");
     for (int i = 0; i < n_tokens; i++) {
         llama_batch batch = llama_batch_init(1, 0, 1);
@@ -135,12 +135,13 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         batch.seq_id[0][0] = 0;
         batch.logits[0] = (i == n_tokens - 1); // Логиты только на последнем токене
 
-        if (llama_decode(g_context, batch) != 0) {
-            LOGE("Ошибка llama_decode на токене %d", i);
-            llama_batch_free(batch);
-            return makeJavaString(env, "Ошибка обработки промпта.");
-        }
+        int res = llama_decode(g_context, batch);
         llama_batch_free(batch);
+        
+        if (res != 0) {
+            LOGE("Ошибка llama_decode на токене %d, код: %d", i, res);
+            return makeJavaString(env, "Ошибка обработки промпта (decode " + std::to_string(res) + ")");
+        }
     }
     LOGI("Промпт успешно обработан.");
 
@@ -174,12 +175,13 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         next.seq_id[0][0] = 0;
         next.logits[0] = true;
 
-        if (llama_decode(g_context, next) != 0) {
-            LOGE("Ошибка llama_decode на шаге генерации %d", i);
-            llama_batch_free(next);
+        int res = llama_decode(g_context, next);
+        llama_batch_free(next);
+        
+        if (res != 0) {
+            LOGE("Ошибка llama_decode на шаге генерации %d, код: %d", i, res);
             break;
         }
-        llama_batch_free(next);
         n_past++;
     }
 
