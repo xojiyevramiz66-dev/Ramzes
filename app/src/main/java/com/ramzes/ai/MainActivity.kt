@@ -1,4 +1,3 @@
-
 package com.ramzes.ai
 
 import android.app.Activity
@@ -13,6 +12,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -34,18 +34,27 @@ class MainActivity : Activity() {
     @Volatile private var busy = false
     @Volatile private var destroyed = false
 
+    // Поток для генерации, чтобы можно было его дождаться при выходе
+    private var generateThread: Thread? = null
+
     private val prefs by lazy {
         getSharedPreferences("ramzes_history", MODE_PRIVATE)
     }
 
     companion object {
-        private const val PICK_MODEL = 100
-        private const val CONTEXT_SIZE = 512
-        private const val MAX_TOKENS = 16
+        // Увеличенные лимиты для нормальной работы модели
+        private const val CONTEXT_SIZE = 2048
+        private const val MAX_TOKENS = 256
         private const val MAX_HISTORY = 20
+        private const val PROMPT_HISTORY = 8
 
         init {
-            System.loadLibrary("ramzes_native")
+            try {
+                System.loadLibrary("ramzes_native")
+            } catch (e: UnsatisfiedLinkError) {
+                // Ошибка загрузки библиотеки будет обработана при первом вызове
+                e.printStackTrace()
+            }
         }
     }
 
@@ -53,11 +62,23 @@ class MainActivity : Activity() {
     private external fun nativeGenerate(prompt: String, maxTokens: Int): String
     private external fun nativeUnloadModel()
 
+    // Современный API выбора файла
+    private val pickModelLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            loadModelFromUri(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createUi()
         restoreHistory()
-        status.text = "Выберите GGUF-модель"
+        
+        // Если модель уже была загружена (после поворота экрана), статус обновится
+        status.text = if (modelLoaded) "Модель загружена" else "Выберите GGUF-модель"
+        setControls(!busy)
     }
 
     private fun createUi() {
@@ -118,30 +139,15 @@ class MainActivity : Activity() {
 
     private fun chooseModel() {
         if (busy) return
-
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-        }
-
         try {
-            startActivityForResult(intent, PICK_MODEL)
+            // Фильтр по типу файла: gguf обычно определяется как application/octet-stream
+            pickModelLauncher.launch(arrayOf("*/*"))
         } catch (e: Exception) {
             status.text = "Не удалось открыть файл: ${e.message}"
         }
     }
 
-    @Deprecated("Compatibility")
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?
-    ) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-
+    private fun loadModelFromUri(uri: Uri) {
         if (busy) return
         busy = true
         modelLoaded = false
@@ -160,8 +166,9 @@ class MainActivity : Activity() {
                 }
 
                 result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
-            } catch (e: Exception) {
+            } catch (e: Throwable) { // Ловим и OOM (OutOfMemoryError)
                 result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
+                e.printStackTrace()
             }
 
             val finalResult = result
@@ -240,7 +247,8 @@ class MainActivity : Activity() {
     }
 
     private fun buildPrompt(): String {
-        val recent = messages.takeLast(8)
+        // Берем последние сообщения, но ограничиваем их количество
+        val recent = messages.takeLast(PROMPT_HISTORY)
 
         return buildString {
             append(
@@ -269,8 +277,7 @@ class MainActivity : Activity() {
 
         input.setText("")
         try {
-            val manager = getSystemService(Context.INPUT_METHOD_SERVICE)
-                as InputMethodManager
+            val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             manager.hideSoftInputFromWindow(input.windowToken, 0)
         } catch (_: Exception) {}
 
@@ -282,20 +289,25 @@ class MainActivity : Activity() {
         val prompt = buildPrompt()
         busy = true
         setControls(false)
-        status.text = "Обработка запроса..."
+        status.text = "RAMZES AI генерирует ответ..."
 
-        thread(name = "ramzes-generate") {
+        generateThread = thread(name = "ramzes-generate") {
             val answer = try {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_DEFAULT
-                )
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
+                
+                // Добавляем логирование в Logcat для отладки
+                android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
+                
                 val result = nativeGenerate(prompt, MAX_TOKENS).trim()
+                
+                android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
+
                 if (result.isBlank()) {
                     "Модель вернула пустой ответ. Проверьте Logcat."
                 } else {
                     result
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 "Ошибка генерации: ${e.message ?: e.javaClass.simpleName}"
             }
 
@@ -309,6 +321,7 @@ class MainActivity : Activity() {
                     setControls(true)
                 }
                 busy = false
+                generateThread = null
             }
         }
     }
@@ -365,9 +378,21 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         destroyed = true
+        
+        // Ждём завершения генерации, чтобы не выгружать модель во время работы C++ кода
+        val t = generateThread
+        if (t != null && t.isAlive) {
+            try {
+                // Ждем максимум 2 секунды, чтобы не вешать UI
+                t.join(2000)
+            } catch (_: InterruptedException) {}
+        }
+        
+        // Выгружаем модель, чтобы освободить оперативную память
+        try {
+            nativeUnloadModel()
+        } catch (_: Throwable) {}
+        
         super.onDestroy()
-
-        // Не выгружаем модель конкурентно с выполняющейся генерацией.
-        // Процесс Android освободит память при завершении процесса.
     }
 }
