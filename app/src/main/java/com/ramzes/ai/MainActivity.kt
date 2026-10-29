@@ -1,3 +1,4 @@
+
 package com.ramzes.ai
 
 import android.app.Activity
@@ -20,87 +21,68 @@ import java.io.IOException
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
-
     private lateinit var status: TextView
     private lateinit var chat: TextView
     private lateinit var input: EditText
     private lateinit var sendButton: Button
     private lateinit var modelButton: Button
-    private lateinit var scrollView: ScrollView
+    private lateinit var scroll: ScrollView
 
     private val messages = mutableListOf<Pair<String, String>>()
+
+    @Volatile private var modelLoaded = false
+    @Volatile private var busy = false
+    @Volatile private var destroyed = false
 
     private val prefs by lazy {
         getSharedPreferences("ramzes_history", MODE_PRIVATE)
     }
 
-    @Volatile
-    private var modelLoaded = false
-
-    @Volatile
-    private var busy = false
-
-    @Volatile
-    private var activityDestroyed = false
-
     companion object {
         private const val PICK_MODEL = 100
-        private const val MAX_HISTORY_MESSAGES = 80
-        private const val PROMPT_HISTORY_MESSAGES = 6
-        private const val CONTEXT_SIZE = 1024
-        private const val MAX_GENERATION_TOKENS = 64
+        private const val CONTEXT_SIZE = 512
+        private const val MAX_TOKENS = 16
+        private const val MAX_HISTORY = 20
 
         init {
             System.loadLibrary("ramzes_native")
         }
     }
 
-    private external fun nativeLoadModel(
-        path: String,
-        contextSize: Int
-    ): String
-
-    private external fun nativeGenerate(
-        prompt: String,
-        maxTokens: Int
-    ): String
-
+    private external fun nativeLoadModel(path: String, contextSize: Int): String
+    private external fun nativeGenerate(prompt: String, maxTokens: Int): String
     private external fun nativeUnloadModel()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        activityDestroyed = false
-        createInterface()
+        createUi()
         restoreHistory()
-
-        status.text = "Модель не загружена"
+        status.text = "Выберите GGUF-модель"
     }
 
-    private fun createInterface() {
+    private fun createUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(16, 12, 16, 12)
         }
 
-        val title = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "RAMZES AI"
             textSize = 26f
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 4, 0, 4)
-        }
+        })
 
         status = TextView(this).apply {
             textSize = 14f
             setPadding(0, 8, 0, 8)
         }
+        root.addView(status)
 
         modelButton = Button(this).apply {
             text = "Выбрать GGUF-модель"
-            setOnClickListener {
-                chooseModel()
-            }
+            setOnClickListener { chooseModel() }
         }
+        root.addView(modelButton)
 
         chat = TextView(this).apply {
             textSize = 16f
@@ -108,59 +90,34 @@ class MainActivity : Activity() {
             setPadding(4, 8, 4, 8)
         }
 
-        scrollView = ScrollView(this).apply {
+        scroll = ScrollView(this).apply {
             isFillViewport = true
-
-            // Исправление ошибки Unresolved reference: LayoutParams.
             addView(chat)
         }
+
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         input = EditText(this).apply {
             hint = "Напишите сообщение..."
             maxLines = 4
-            setSingleLine(false)
         }
 
         sendButton = Button(this).apply {
             text = "Отправить"
-            setOnClickListener {
-                sendMessage()
-            }
+            setOnClickListener { sendMessage() }
         }
 
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-
-            addView(
-                input,
-                LinearLayout.LayoutParams(0, -2, 1f)
-            )
-
-            addView(
-                sendButton,
-                LinearLayout.LayoutParams(-2, -2)
-            )
+            addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(sendButton)
         }
-
-        root.addView(title)
-        root.addView(status)
-        root.addView(modelButton)
-
-        root.addView(
-            scrollView,
-            LinearLayout.LayoutParams(-1, 0, 1f)
-        )
-
         root.addView(bottom)
         setContentView(root)
     }
 
     private fun chooseModel() {
-        if (busy) {
-            showStatus("Дождитесь завершения текущей операции.")
-            return
-        }
+        if (busy) return
 
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -168,16 +125,13 @@ class MainActivity : Activity() {
         }
 
         try {
-            @Suppress("DEPRECATION")
             startActivityForResult(intent, PICK_MODEL)
         } catch (e: Exception) {
-            showStatus(
-                "Не удалось открыть выбор файла: ${errorMessage(e)}"
-            )
+            status.text = "Не удалось открыть файл: ${e.message}"
         }
     }
 
-    @Deprecated("Используется для совместимости с существующим проектом")
+    @Deprecated("Compatibility")
     override fun onActivityResult(
         requestCode: Int,
         resultCode: Int,
@@ -185,178 +139,100 @@ class MainActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) {
-            return
-        }
+        if (requestCode != PICK_MODEL || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
 
-        val uri: Uri = data?.data ?: run {
-            showStatus("Файл не выбран.")
-            return
-        }
-
-        if (busy) {
-            showStatus("Дождитесь завершения текущей операции.")
-            return
-        }
-
+        if (busy) return
         busy = true
         modelLoaded = false
-        setControlsEnabled(false)
-        showStatus("Импорт GGUF-модели...")
+        setControls(false)
+        status.text = "Копирование модели..."
 
-        thread(name = "ramzes-model-loader") {
+        thread(name = "ramzes-load") {
+            var result = "Ошибка загрузки модели"
+
             try {
-                val modelFile = copyModel(uri)
-
-                if (activityDestroyed) {
-                    return@thread
-                }
+                val file = copyModel(uri)
+                if (destroyed) return@thread
 
                 runOnUiThread {
-                    if (!activityDestroyed) {
-                        status.text = "Загрузка модели в память..."
-                    }
+                    if (!destroyed) status.text = "Загрузка модели в память..."
                 }
 
-                val result = nativeLoadModel(
-                    modelFile.absolutePath,
-                    CONTEXT_SIZE
-                )
-
-                val loaded = result == "OK"
-
-                runOnUiThread {
-                    if (!activityDestroyed) {
-                        modelLoaded = loaded
-
-                        status.text = if (loaded) {
-                            "Модель загружена: ${modelFile.name}"
-                        } else {
-                            result.removePrefix("ERROR: ")
-                        }
-
-                        setControlsEnabled(true)
-                    }
-                }
+                result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
             } catch (e: Exception) {
-                runOnUiThread {
-                    if (!activityDestroyed) {
-                        modelLoaded = false
-                        status.text =
-                            "Ошибка загрузки: ${errorMessage(e)}"
-                        setControlsEnabled(true)
+                result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
+            }
+
+            val finalResult = result
+            runOnUiThread {
+                if (!destroyed) {
+                    modelLoaded = finalResult == "OK"
+                    status.text = if (modelLoaded) {
+                        "Модель загружена"
+                    } else {
+                        finalResult
                     }
+                    setControls(true)
                 }
-            } finally {
                 busy = false
             }
         }
     }
 
     private fun copyModel(uri: Uri): File {
-        val directory = File(filesDir, "models")
-
-        if (!directory.exists() && !directory.mkdirs()) {
-            throw IOException("Не удалось создать папку моделей.")
+        val dir = File(filesDir, "models")
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IOException("Не удалось создать папку моделей")
         }
 
-        val destination = File(directory, "ramzes_model.gguf")
-        val temporary = File(directory, "ramzes_model.tmp")
-        val backup = File(directory, "ramzes_model.bak")
-
-        try {
-            val source = contentResolver.openInputStream(uri)
-                ?: throw IOException("Не удалось открыть выбранный файл.")
-
-            source.use { inputStream ->
-                FileOutputStream(temporary).use { outputStream ->
-                    inputStream.copyTo(outputStream)
-                    outputStream.fd.sync()
-                }
-            }
-
-            if (!temporary.isFile || temporary.length() == 0L) {
-                throw IOException("Выбран пустой файл.")
-            }
-
-            val displayName = queryDisplayName(uri)
-
-            if (
-                displayName != null &&
-                !displayName.endsWith(".gguf", ignoreCase = true)
-            ) {
-                throw IOException(
-                    "Выберите файл модели с расширением .gguf."
-                )
-            }
-
-            var backupCreated = false
-
-            if (destination.exists()) {
-                if (backup.exists() && !backup.delete()) {
-                    throw IOException(
-                        "Не удалось удалить старую резервную копию."
-                    )
-                }
-
-                if (!destination.renameTo(backup)) {
-                    throw IOException(
-                        "Не удалось сохранить предыдущую модель."
-                    )
-                }
-
-                backupCreated = true
-            }
-
-            try {
-                if (!temporary.renameTo(destination)) {
-                    temporary.copyTo(destination, overwrite = true)
-                    temporary.delete()
-                }
-            } catch (e: Exception) {
-                destination.delete()
-
-                if (backupCreated) {
-                    backup.renameTo(destination)
-                }
-
-                throw IOException(
-                    "Не удалось сохранить новую модель.",
-                    e
-                )
-            }
-
-            if (backupCreated) {
-                backup.delete()
-            }
-
-            return destination
-        } catch (e: Exception) {
-            temporary.delete()
-            throw e
+        val name = queryDisplayName(uri)
+        if (name != null && !name.endsWith(".gguf", true)) {
+            throw IOException("Выберите файл .gguf")
         }
+
+        val destination = File(dir, "ramzes_model.gguf")
+        val temp = File(dir, "ramzes_model.tmp")
+
+        contentResolver.openInputStream(uri).use { source ->
+            if (source == null) throw IOException("Не удалось открыть файл")
+            FileOutputStream(temp).use { output ->
+                source.copyTo(output)
+                output.fd.sync()
+            }
+        }
+
+        if (!temp.exists() || temp.length() == 0L) {
+            temp.delete()
+            throw IOException("Файл модели пуст")
+        }
+
+        if (destination.exists() && !destination.delete()) {
+            temp.delete()
+            throw IOException("Не удалось заменить старую модель")
+        }
+
+        if (!temp.renameTo(destination)) {
+            temp.copyTo(destination, overwrite = true)
+            temp.delete()
+        }
+
+        return destination
     }
 
     private fun queryDisplayName(uri: Uri): String? {
         return try {
             contentResolver.query(
                 uri,
-                arrayOf(
-                    android.provider.OpenableColumns.DISPLAY_NAME
-                ),
-                null,
-                null,
-                null
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null, null, null
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    val index = cursor.getColumnIndex(
+                    val i = cursor.getColumnIndex(
                         android.provider.OpenableColumns.DISPLAY_NAME
                     )
-
-                    if (index >= 0) cursor.getString(index) else null
-                } else {
-                    null
-                }
+                    if (i >= 0) cursor.getString(i) else null
+                } else null
             }
         } catch (_: Exception) {
             null
@@ -364,27 +240,18 @@ class MainActivity : Activity() {
     }
 
     private fun buildPrompt(): String {
-        val recentMessages = messages.takeLast(
-            PROMPT_HISTORY_MESSAGES
-        )
+        val recent = messages.takeLast(8)
 
         return buildString {
             append(
                 "<|im_start|>system\n" +
-                    "Ты RAMZES AI, полезный и точный помощник. " +
-                    "Отвечай на языке пользователя. " +
-                    "Если пользователь пишет по-русски, отвечай по-русски.\n" +
-                    "<|im_end|>\n"
+                "Ты RAMZES AI, полезный помощник. " +
+                "Отвечай на языке пользователя.\n<|im_end|>\n"
             )
 
-            recentMessages.forEach { (speaker, message) ->
+            recent.forEach { (speaker, text) ->
                 val role = if (speaker == "Вы") "user" else "assistant"
-
-                append("<|im_start|>")
-                append(role)
-                append('\n')
-                append(message)
-                append("\n<|im_end|>\n")
+                append("<|im_start|>$role\n$text\n<|im_end|>\n")
             }
 
             append("<|im_start|>assistant\n")
@@ -393,23 +260,19 @@ class MainActivity : Activity() {
 
     private fun sendMessage() {
         val question = input.text.toString().trim()
-
-        if (question.isEmpty()) {
-            return
-        }
-
-        if (busy) {
-            showStatus("Дождитесь завершения текущей операции.")
-            return
-        }
+        if (question.isEmpty() || busy) return
 
         if (!modelLoaded) {
-            showStatus("Сначала загрузите GGUF-модель.")
+            status.text = "Сначала загрузите модель"
             return
         }
 
         input.setText("")
-        hideKeyboard()
+        try {
+            val manager = getSystemService(Context.INPUT_METHOD_SERVICE)
+                as InputMethodManager
+            manager.hideSoftInputFromWindow(input.windowToken, 0)
+        } catch (_: Exception) {}
 
         messages.add("Вы" to question)
         trimHistory()
@@ -417,158 +280,94 @@ class MainActivity : Activity() {
         saveHistory()
 
         val prompt = buildPrompt()
-
         busy = true
-        setControlsEnabled(false)
-        showStatus("RAMZES AI генерирует ответ...")
+        setControls(false)
+        status.text = "Обработка запроса..."
 
-        thread(name = "ramzes-generation") {
+        thread(name = "ramzes-generate") {
             val answer = try {
-                nativeGenerate(
-                    prompt,
-                    MAX_GENERATION_TOKENS
-                ).trim().ifBlank {
-                    "Модель не вернула текст. " +
-                        "Проверьте совместимость модели и шаблона чата."
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_DEFAULT
+                )
+                val result = nativeGenerate(prompt, MAX_TOKENS).trim()
+                if (result.isBlank()) {
+                    "Модель вернула пустой ответ. Проверьте Logcat."
+                } else {
+                    result
                 }
             } catch (e: Exception) {
-                "Ошибка генерации: ${errorMessage(e)}"
+                "Ошибка генерации: ${e.message ?: e.javaClass.simpleName}"
             }
 
             runOnUiThread {
-                if (!activityDestroyed) {
+                if (!destroyed) {
                     messages.add("RAMZES AI" to answer)
                     trimHistory()
                     renderChat()
                     saveHistory()
-
-                    status.text = if (modelLoaded) {
-                        "Готово"
-                    } else {
-                        "Модель не загружена"
-                    }
-
-                    setControlsEnabled(true)
+                    status.text = "Готово"
+                    setControls(true)
                 }
+                busy = false
             }
-
-            busy = false
         }
     }
 
     private fun trimHistory() {
-        while (messages.size > MAX_HISTORY_MESSAGES) {
-            messages.removeAt(0)
-        }
+        while (messages.size > MAX_HISTORY) messages.removeAt(0)
     }
 
     private fun renderChat() {
-        chat.text = messages.joinToString("\n\n") { (speaker, message) ->
-            "$speaker:\n$message"
+        chat.text = messages.joinToString("\n\n") { (speaker, text) ->
+            "$speaker:\n$text"
         }
-
-        scrollView.post {
-            scrollView.fullScroll(ScrollView.FOCUS_DOWN)
-        }
+        scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
     private fun saveHistory() {
         try {
             val array = JSONArray()
-
-            messages.takeLast(MAX_HISTORY_MESSAGES).forEach {
-                (speaker, message) ->
+            messages.forEach { (speaker, text) ->
                 array.put(
                     JSONObject()
                         .put("speaker", speaker)
-                        .put("message", message)
+                        .put("message", text)
                 )
             }
-
-            prefs.edit()
-                .putString("messages", array.toString())
-                .apply()
-        } catch (_: Exception) {
-            showStatus("Не удалось сохранить историю чата.")
-        }
+            prefs.edit().putString("messages", array.toString()).apply()
+        } catch (_: Exception) {}
     }
 
     private fun restoreHistory() {
         try {
-            val json = prefs.getString("messages", "[]") ?: "[]"
-            val array = JSONArray(json)
-
-            messages.clear()
-
-            val start = maxOf(
-                0,
-                array.length() - MAX_HISTORY_MESSAGES
-            )
-
-            for (i in start until array.length()) {
+            val array = JSONArray(prefs.getString("messages", "[]") ?: "[]")
+            for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
-                val speaker = item.optString("speaker", "")
-                val message = item.optString("message", "")
-
-                if (
-                    speaker.isNotBlank() &&
-                    message.isNotBlank()
-                ) {
-                    messages.add(speaker to message)
+                val speaker = item.optString("speaker")
+                val text = item.optString("message")
+                if (speaker.isNotBlank() && text.isNotBlank()) {
+                    messages.add(speaker to text)
                 }
             }
-
-            renderChat()
+            trimHistory()
         } catch (_: Exception) {
             messages.clear()
-            renderChat()
         }
+        renderChat()
     }
 
-    private fun hideKeyboard() {
-        try {
-            val manager = getSystemService(
-                Context.INPUT_METHOD_SERVICE
-            ) as InputMethodManager
-
-            manager.hideSoftInputFromWindow(input.windowToken, 0)
-        } catch (_: Exception) {
-            // Ошибка закрытия клавиатуры не прерывает отправку.
-        }
-    }
-
-    private fun showStatus(message: String) {
-        if (!activityDestroyed && ::status.isInitialized) {
-            status.text = message
-        }
-    }
-
-    private fun setControlsEnabled(enabled: Boolean) {
-        if (activityDestroyed) return
-
+    private fun setControls(enabled: Boolean) {
+        if (destroyed) return
         sendButton.isEnabled = enabled
         modelButton.isEnabled = enabled
         input.isEnabled = enabled
     }
 
-    private fun errorMessage(e: Exception): String {
-        return e.message?.takeIf { it.isNotBlank() }
-            ?: e.javaClass.simpleName
-    }
-
     override fun onDestroy() {
-        activityDestroyed = true
-
-        // Выгружаем модель вне UI-потока.
-        // C++ должен защищать операции с моделью через mutex.
-        thread(name = "ramzes-model-cleanup") {
-            try {
-                nativeUnloadModel()
-            } catch (_: Exception) {
-                // Игнорируем ошибку очистки при закрытии экрана.
-            }
-        }
-
+        destroyed = true
         super.onDestroy()
+
+        // Не выгружаем модель конкурентно с выполняющейся генерацией.
+        // Процесс Android освободит память при завершении процесса.
     }
 }
