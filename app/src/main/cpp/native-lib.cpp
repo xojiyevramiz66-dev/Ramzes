@@ -41,6 +41,70 @@ void releaseModelLocked() {
     if (g_model != nullptr) { llama_model_free(g_model); g_model = nullptr; }
 }
 
+// Простой парсер одной строки в массив сообщений для шаблона чата.
+// Формат от Kotlin: "Вы: привет\nRAMZES AI:" или "Вы: привет\nRAMZES AI: ответ\nВы: следующий..."
+std::vector<std::pair<std::string, std::string>> parseConversation(const std::string &raw) {
+    std::vector<std::pair<std::string, std::string>> result;
+    std::string remaining = raw;
+
+    while (!remaining.empty()) {
+        // Ищем начало сообщения пользователя
+        size_t userPos = remaining.find("Вы: ");
+        if (userPos == std::string::npos) {
+            // Если не нашли "Вы:", считаем весь текст сообщением пользователя
+            if (!remaining.empty()) {
+                result.emplace_back("user", remaining);
+            }
+            break;
+        }
+
+        // Ищем начало ответа модели после сообщения пользователя
+        size_t aiPos = remaining.find("\nRAMZES AI:");
+        if (aiPos == std::string::npos) {
+            // Только сообщение пользователя, без ответа (последний ход)
+            std::string userContent = remaining.substr(userPos + 4);
+            // Убираем хвост "RAMZES AI:" если он есть в конце
+            if (userContent.find("RAMZES AI:") != std::string::npos) {
+                userContent = userContent.substr(0, userContent.find("\nRAMZES AI:"));
+            }
+            // Тримим пробелы
+            userContent.erase(0, userContent.find_first_not_of(" \n"));
+            userContent.erase(userContent.find_last_not_of(" \n") + 1);
+            if (!userContent.empty()) {
+                result.emplace_back("user", userContent);
+            }
+            break;
+        }
+
+        std::string userContent = remaining.substr(userPos + 4, aiPos - userPos - 4);
+        userContent.erase(0, userContent.find_first_not_of(" \n"));
+        userContent.erase(userContent.find_last_not_of(" \n") + 1);
+        if (!userContent.empty()) {
+            result.emplace_back("user", userContent);
+        }
+
+        // Ищем следующий "Вы:" после ответа AI
+        size_t nextUser = remaining.find("\nВы: ", aiPos);
+        size_t aiContentEnd = (nextUser != std::string::npos) ? nextUser : remaining.length();
+        
+        // Ответ AI: от "\nRAMZES AI:" до следующего "Вы:" (или до конца)
+        std::string aiContent = remaining.substr(aiPos + 11, aiContentEnd - aiPos - 11);
+        aiContent.erase(0, aiContent.find_first_not_of(" \n"));
+        aiContent.erase(aiContent.find_last_not_of(" \n") + 1);
+        if (!aiContent.empty()) {
+            result.emplace_back("assistant", aiContent);
+        }
+
+        if (nextUser != std::string::npos) {
+            remaining = remaining.substr(nextUser + 1); // +1 чтобы пропустить \n
+        } else {
+            break;
+        }
+    }
+
+    return result;
+}
+
 } // namespace
 
 extern "C"
@@ -67,10 +131,10 @@ Java_com_ramzes_ai_MainActivity_nativeLoadModel(
         return makeJavaString(env, "ERROR: Не удалось загрузить модель.");
     }
 
-    // Оптимальные параметры для Android (взяты из Ponko)
+    // Оптимальные параметры для Android (как в Ponko)
     llama_context_params contextParams = llama_context_default_params();
-    contextParams.n_ctx = 4096;       // Контекст как в Ponko
-    contextParams.n_batch = 512;      // Батч как в Ponko
+    contextParams.n_ctx = 4096;       // Контекст
+    contextParams.n_batch = 512;      // Батч
     contextParams.n_ubatch = 512;     
     contextParams.n_threads = 4;      
     contextParams.n_threads_batch = 4;
@@ -103,36 +167,63 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
         return makeJavaString(env, "Ошибка: модель не загружена.");
     }
 
-    // 1. Получаем сырой текст (историю чата) от Kotlin
     const std::string rawText = jstringToString(env, userPrompt);
     if (rawText.empty()) return makeJavaString(env, "Введите сообщение.");
 
     LOGI("--- СТАРТ ГЕНЕРАЦИИ ---");
     
-    // 2. Применяем шаблон чата, вшитый в модель (ChatML, Llama3, Gemma и т.д.)
-    const char *tmpl = llama_model_chat_template(g_model, nullptr);
-    std::string prompt;
-    
-    if (tmpl != nullptr) {
-        // Используем встроенный шаблон (как это делает Ponko)
-        std::vector<char> formatted(8192);
-        int n = llama_chat_apply_template(tmpl, rawText.c_str(), rawText.length(), true, formatted.data(), formatted.size());
-        if (n > 0) {
-            prompt.assign(formatted.data(), n);
-            LOGI("Применен встроенный шаблон чата.");
-        } else {
-            prompt = rawText; // Фолбэк
-            LOGI("Не удалось применить шаблон, используем сырой текст.");
-        }
-    } else {
-        // Если в модели нет шаблона, используем сырой текст
-        prompt = rawText;
-        LOGI("Шаблон чата не найден, используем сырой текст.");
+    // 1. Парсим текст в массив сообщений
+    auto parsed = parseConversation(rawText);
+    if (parsed.empty()) {
+        return makeJavaString(env, "Не удалось разобрать промпт.");
     }
 
+    // 2. Формируем массив llama_chat_message (нужно хранить строки в стабильном месте)
+    std::vector<llama_chat_message> messages;
+    messages.reserve(parsed.size());
+    for (const auto &p : parsed) {
+        messages.push_back({p.first.c_str(), p.second.c_str()});
+    }
+
+    // 3. Применяем встроенный шаблон чата
+    const char *tmpl = llama_model_chat_template(g_model, nullptr);
+    std::string prompt;
+    constexpr int TEMPLATE_BUF_SIZE = 16384;
+    std::vector<char> formatted(TEMPLATE_BUF_SIZE);
+    
+    if (tmpl != nullptr) {
+        int n = llama_chat_apply_template(
+            tmpl,
+            messages.data(),
+            messages.size(),
+            true,
+            formatted.data(),
+            formatted.size()
+        );
+        if (n > 0) {
+            prompt.assign(formatted.data(), n);
+            LOGI("Применен шаблон чата. Длина промпта: %d", n);
+        } else {
+            // Фолбэк: склеиваем вручную
+            prompt.clear();
+            for (const auto &p : parsed) {
+                prompt += p.first + ": " + p.second + "\n";
+            }
+            prompt += "assistant: ";
+            LOGE("Не удалось применить шаблон, используем фолбэк.");
+        }
+    } else {
+        prompt.clear();
+        for (const auto &p : parsed) {
+            prompt += p.first + ": " + p.second + "\n";
+        }
+        prompt += "assistant: ";
+        LOGI("Шаблон чата не найден, используем фолбэк.");
+    }
+
+    // 4. Токенизация
     const llama_vocab *vocab = llama_model_get_vocab(g_model);
     
-    // 3. Токенизация
     int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), nullptr, 0, true, true);
     if (n_tokens < 0) n_tokens = -n_tokens;
     
@@ -144,15 +235,15 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     }
     LOGI("Промпт разбит на %d токенов", n_tokens);
 
-    if (n_tokens >= 4000) {
+    if (n_tokens >= 3800) {
         return makeJavaString(env, "Промпт слишком длинный для контекста 4096.");
     }
 
-    // 4. Очистка памяти и сэмплера
+    // 5. Очистка памяти и сэмплера
     llama_memory_clear(llama_get_memory(g_context), true);
     llama_sampler_reset(g_sampler);
 
-    // 5. ДЕКОДИРОВАНИЕ ПРОМПТА ОДНИМ БАТЧЕМ (исправление ошибки -1)
+    // 6. ДЕКОДИРОВАНИЕ ПРОМПТА ОДНИМ БАТЧЕМ
     LOGI("Начинаем обработку промпта...");
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
@@ -172,7 +263,7 @@ Java_com_ramzes_ai_MainActivity_nativeGenerate(
     }
     LOGI("Промпт успешно обработан.");
 
-    // 6. ГЕНЕРАЦИЯ (по одному токену)
+    // 7. ГЕНЕРАЦИЯ (по одному токену)
     std::string answer;
     int n_past = n_tokens;
     int limit = std::min((int)maxTokens, 512);
