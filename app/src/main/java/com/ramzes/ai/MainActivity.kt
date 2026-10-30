@@ -41,11 +41,11 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val CONTEXT_SIZE = 512
-        private const val MAX_TOKENS = 128
+        private const val CONTEXT_SIZE = 4096
+        private const val MAX_TOKENS = 512
         private const val MAX_HISTORY = 20
-        private const val PROMPT_HISTORY = 2
-        private const val GENERATION_TIMEOUT_MS = 30000L
+        private const val PROMPT_HISTORY = 4
+        private const val GENERATION_TIMEOUT_MS = 60000L
 
         init {
             try {
@@ -232,7 +232,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // УПРОЩЁННЫЙ ПРОМПТ: без ChatML, чтобы исключить несовместимость шаблона
+    // УПРОЩЁННЫЙ ПРОМПТ: без спецтокенов. C++ сам применит шаблон из модели.
     private fun buildPrompt(): String {
         val recent = messages.takeLast(PROMPT_HISTORY)
         return buildString {
@@ -269,7 +269,7 @@ class MainActivity : ComponentActivity() {
         status.text = "RAMZES AI генерирует ответ..."
 
         val resultRef = AtomicReference<String>(
-            "Превышено время ожидания (30 сек). Модель зависла или не хватает памяти."
+            "Превышено время ожидания (60 сек). Модель зависла."
         )
 
         generateThread = thread(name = "ramzes-generate") {
@@ -288,7 +288,7 @@ class MainActivity : ComponentActivity() {
             worker.join(GENERATION_TIMEOUT_MS)
 
             if (worker.isAlive) {
-                android.util.Log.e("RAMZES", "Таймаут! Модель зависла внутри llama_decode.")
+                android.util.Log.e("RAMZES", "Таймаут генерации!")
                 worker.interrupt()
             }
 
