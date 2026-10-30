@@ -148,8 +148,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (!destroyed) status.text = "Загрузка модели в память..."
                 }
-                
-                // Загрузка через net.ladenthin.llama
+
                 val params = ModelParameters()
                     .setModel(file.absolutePath)
                     .setCtxSize(CONTEXT_SIZE)
@@ -160,7 +159,7 @@ class MainActivity : ComponentActivity() {
                     .setParallel(1)
                     .setKeep(64)
                     .setGpuLayers(0)
-                
+
                 llamaModel = LlamaModel(params)
                 result = "OK"
             } catch (e: Throwable) {
@@ -259,7 +258,6 @@ class MainActivity : ComponentActivity() {
         renderChat()
         saveHistory()
 
-        // Формируем массив сообщений для llama.cpp (как в Ponko)
         val msgPairs = mutableListOf<Pair<String, String>>()
         val recent = messages.takeLast(PROMPT_HISTORY)
         recent.forEach { (speaker, text) ->
@@ -301,7 +299,7 @@ class MainActivity : ComponentActivity() {
                     } finally {
                         runCatching { iterator.close() }
                     }
-                    
+
                     val result = sb.toString().trim()
                     resultRef.set(if (result.isBlank()) "Модель вернула пустой ответ." else result)
                 } catch (e: Throwable) {
