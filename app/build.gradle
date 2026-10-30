@@ -35,5 +35,6 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.activity:activity-ktx:1.9.3'
     implementation 'androidx.appcompat:appcompat:1.7.0'
-    implementation 'net.ladenthin:llama:1.2.0'  // проверьте версию
+    // Правильный артефакт для Android: llama-android, а не llama
+    implementation 'net.ladenthin:llama-android:5.0.6'
 }
