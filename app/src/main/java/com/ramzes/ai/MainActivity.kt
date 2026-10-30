@@ -12,6 +12,10 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import net.ladenthin.llama.LlamaModel
+import net.ladenthin.llama.parameters.InferenceParameters
+import net.ladenthin.llama.parameters.ModelParameters
+import net.ladenthin.llama.value.Pair
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -29,6 +33,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var scroll: ScrollView
 
     private val messages = mutableListOf<Pair<String, String>>()
+    private var llamaModel: LlamaModel? = null
 
     @Volatile private var modelLoaded = false
     @Volatile private var busy = false
@@ -44,21 +49,9 @@ class MainActivity : ComponentActivity() {
         private const val CONTEXT_SIZE = 4096
         private const val MAX_TOKENS = 512
         private const val MAX_HISTORY = 20
-        private const val PROMPT_HISTORY = 4
-        private const val GENERATION_TIMEOUT_MS = 60000L
-
-        init {
-            try {
-                System.loadLibrary("ramzes_native")
-            } catch (e: UnsatisfiedLinkError) {
-                e.printStackTrace()
-            }
-        }
+        private const val PROMPT_HISTORY = 8
+        private const val GENERATION_TIMEOUT_MS = 120000L
     }
-
-    private external fun nativeLoadModel(path: String, contextSize: Int): String
-    private external fun nativeGenerate(prompt: String, maxTokens: Int): String
-    private external fun nativeUnloadModel()
 
     private val pickModelLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -155,7 +148,21 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (!destroyed) status.text = "Загрузка модели в память..."
                 }
-                result = nativeLoadModel(file.absolutePath, CONTEXT_SIZE)
+                
+                // Загрузка через net.ladenthin.llama
+                val params = ModelParameters()
+                    .setModel(file.absolutePath)
+                    .setCtxSize(CONTEXT_SIZE)
+                    .setPredict(MAX_TOKENS)
+                    .setThreads(4)
+                    .setThreadsBatch(4)
+                    .setBatchSize(512)
+                    .setParallel(1)
+                    .setKeep(64)
+                    .setGpuLayers(0)
+                
+                llamaModel = LlamaModel(params)
+                result = "OK"
             } catch (e: Throwable) {
                 result = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
                 e.printStackTrace()
@@ -232,22 +239,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // УПРОЩЁННЫЙ ПРОМПТ: без спецтокенов. C++ сам применит шаблон из модели.
-    private fun buildPrompt(): String {
-        val recent = messages.takeLast(PROMPT_HISTORY)
-        return buildString {
-            recent.forEach { (speaker, text) ->
-                append("$speaker: $text\n")
-            }
-            append("RAMZES AI:")
-        }
-    }
-
     private fun sendMessage() {
         val question = input.text.toString().trim()
         if (question.isEmpty() || busy) return
 
-        if (!modelLoaded) {
+        if (!modelLoaded || llamaModel == null) {
             status.text = "Сначала загрузите модель"
             return
         }
@@ -263,21 +259,50 @@ class MainActivity : ComponentActivity() {
         renderChat()
         saveHistory()
 
-        val prompt = buildPrompt()
+        // Формируем массив сообщений для llama.cpp (как в Ponko)
+        val msgPairs = mutableListOf<Pair<String, String>>()
+        val recent = messages.takeLast(PROMPT_HISTORY)
+        recent.forEach { (speaker, text) ->
+            val role = if (speaker == "Вы") "user" else "assistant"
+            msgPairs.add(Pair(role, text))
+        }
+
         busy = true
         setControls(false)
         status.text = "RAMZES AI генерирует ответ..."
 
         val resultRef = AtomicReference<String>(
-            "Превышено время ожидания (60 сек). Модель зависла."
+            "Превышено время ожидания (120 сек). Модель зависла."
         )
 
         generateThread = thread(name = "ramzes-generate") {
             val worker = thread {
                 try {
-                    android.util.Log.d("RAMZES", "Начало генерации. Длина промпта: ${prompt.length}")
-                    val result = nativeGenerate(prompt, MAX_TOKENS).trim()
-                    android.util.Log.d("RAMZES", "Генерация завершена. Длина ответа: ${result.length}")
+                    val params = InferenceParameters.empty()
+                        .withMessages(null, msgPairs)
+                        .withCachePrompt(true)
+                        .withSlotId(0)
+                        .withNPredict(MAX_TOKENS)
+                        .withTemperature(0.7f)
+                        .withTopK(40)
+                        .withTopP(0.9f)
+                        .withRepeatPenalty(1.1f)
+                        .withSeed((System.nanoTime() and 0x7FFFFFFF).toInt())
+
+                    val sb = StringBuilder()
+                    val iterator = llamaModel!!.generateChat(params).iterator()
+                    try {
+                        while (iterator.hasNext()) {
+                            val piece = iterator.next()
+                            if (piece.text.isNotEmpty()) {
+                                sb.append(piece.text)
+                            }
+                        }
+                    } finally {
+                        runCatching { iterator.close() }
+                    }
+                    
+                    val result = sb.toString().trim()
                     resultRef.set(if (result.isBlank()) "Модель вернула пустой ответ." else result)
                 } catch (e: Throwable) {
                     resultRef.set("Ошибка генерации: ${e.message ?: e.javaClass.simpleName}")
@@ -364,7 +389,7 @@ class MainActivity : ComponentActivity() {
             } catch (_: InterruptedException) {}
         }
         try {
-            nativeUnloadModel()
+            llamaModel?.close()
         } catch (_: Throwable) {}
         super.onDestroy()
     }
